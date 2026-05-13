@@ -13,7 +13,7 @@
 #include "receiver_chain.h"
 #include "usrp.h"
 
-#define NUM_RX_SAMPLES 4096
+#define NUM_RX_SAMPLES 16384
 
 namespace fun
 {
@@ -33,7 +33,7 @@ namespace fun
      *  object. Similarly, the receiver::resume() function can then be used to begin receiving again
      *  after a pause.
      */
-    class receiver
+    class   receiver
     {
     public:
 
@@ -55,7 +55,7 @@ namespace fun
          *    + tx_gain -> 20 even though it is irrelevant for the receiver
          *    + amp -> 1.0 even though it is irrelevant for the receiver
          */
-        receiver(void(*callback)(std::vector<std::vector<unsigned char> > packets), double freq = 5.72e9, double samp_rate = 5e6, double rx_gain = 20, std::string device_addr = "");
+        receiver(void(*callback)(std::vector<std::vector<unsigned char> > packets), double freq = 3.4e9, double samp_rate = 20e6, double rx_gain = 40, std::string device_addr = "serial=314C000"/*"type=b200,serial=314C000,num_recv_frames=700,num_send_frames=700,recv_frame_size=11000,send_frame_size=11000"*/);
 
         /*!
          * \brief Constructor for the receiver that uses the usrp_params struct
