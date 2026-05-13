@@ -15,15 +15,14 @@ using namespace fun;
 void test_tx(double freq, double sample_rate, double tx_gain, double amp, Rate phy_rate);
 bool set_realtime_priority();
 
-double freq = 5.72e9;
-double sample_rate = 5e6;
+double freq = 3.3e9;
+double sample_rate = 20e6;
 double tx_gain = 30;
 //double rx_gain = 30;
-double amp = 0.5;
-Rate phy_rate = RATE_1_2_BPSK;
+double amp = 0.6;
+Rate phy_rate = RATE_1_2_BPSK;//RATE_1_2_QPSK;//RATE_2_3_BPSK;
 
 int main(int argc, char * argv[]){
-
     set_realtime_priority();
 
 	std::cout << "Testing transmit chain..." << std::endl;
@@ -49,11 +48,11 @@ void test_tx(double freq, double sample_rate, double tx_gain, double amp, Rate p
 {
     srand(time(NULL)); //Initialize random seed
 
-    transmitter tx = transmitter(freq, sample_rate, tx_gain, amp);
+    transmitter tx = transmitter(freq, sample_rate, tx_gain, amp, "type=b200,serial=3123B0D");
     std::string known_string("This known string is used to verify the correctness of the received data along with the IEEE CRC-32!");
 
     int num_packets = 1000;
-    int packet_length = 1500;
+    int packet_length = 1900;
     std::vector<std::vector<unsigned char> > packets(num_packets, std::vector<unsigned char>(packet_length));
 
     // Build all the packets

@@ -18,12 +18,12 @@ void test_rx_pause(double freq, double rate, double rx_gain);
 void process_packets_callback(std::vector<std::vector<unsigned char> > packets);
 bool set_realtime_priority();
 
-double freq = 5.72e9;
-double sample_rate = 5e6;
+double freq = 3.35e9;
+double sample_rate = 20e6;
 //double tx_gain = 30;
 double rx_gain = 30;
 //double amp = 0.5;
-//Rate phy_rate = RATE_1_2_BPSK;
+Rate phy_rate =  RATE_1_2_BPSK;//RATE_1_2_QPSK;//RATE_1_2_BPSK;
 
 int rx_count = 0; //!< Total number of packets received since the receiver was activated
 
@@ -60,7 +60,7 @@ void test_rx(double freq, double sample_rate, double rx_gain)
     // Instantiate a usrp
     printf("Instantiating the usrp.\n");
 
-    receiver rx = receiver(&process_packets_callback, freq, sample_rate, rx_gain, "");
+    receiver rx = receiver(&process_packets_callback, freq, sample_rate, rx_gain, "type=b200,serial=314C000,num_recv_frames=700,num_send_frames=700,recv_frame_size=11000,send_frame_size=11000");
 
     while(1);
 }
@@ -84,7 +84,7 @@ void test_rx_pause(double freq, double sample_rate, double rx_gain)
 
     // Instantiate a usrp
     printf("Instantiating the usrp.\n");
-    receiver rx = receiver(&process_packets_callback, freq, sample_rate, rx_gain, "");
+    receiver rx = receiver(&process_packets_callback, freq, sample_rate, rx_gain, "type=b200,serial=314C000,num_recv_frames=700,num_send_frames=700,recv_frame_size=11000,send_frame_size=11000");
 
     while(1)
     {
