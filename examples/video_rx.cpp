@@ -40,9 +40,9 @@
 using namespace fun;
 
 // ---------------------- Radio parameters (must match TX) --------------------
-static const double FREQ        = 3.3e9;
+static const double FREQ        = 3.4e9;
 static const double SAMPLE_RATE = 20e6;
-static const double RX_GAIN     = 25.0;
+static const double RX_GAIN     = 35.0;
 
 // ---------------------- Packet geometry (must match TX) --------------------
 static const std::size_t PACKET_SIZE  = 1900;

@@ -44,11 +44,11 @@
 using namespace fun;
 
 // ---------------------- Radio parameters ------------------------------------
-static const double FREQ        = 3.3e9;              // center freq [Hz]
+static const double FREQ        = 3.4e9;              // center freq [Hz]
 static const double SAMPLE_RATE = 20e6;                 // 16 MHz
 static const double TX_GAIN     = 85.0;
-static const double TX_AMP      = 0.6;
-static const Rate   PHY_RATE    =  RATE_1_2_BPSK;//RATE_3_4_QAM16;//RATE_2_3_BPSK;//      // 36 Mbps, good for video
+static const double TX_AMP      = 0.7;
+static const Rate   PHY_RATE    =  RATE_1_2_QPSK;//RATE_1_2_BPSK;//RATE_3_4_QAM16;//RATE_2_3_BPSK;//      // 36 Mbps, good for video
 
 // ---------------------- Packet geometry -------------------------------------
 static const std::size_t PACKET_SIZE  = 1900;          // strict
