@@ -46,7 +46,7 @@ namespace fun {
          *  - *Note:
          *     + rx_gain -> 20 even though it is irrelevant for the transmitter
          */
-        transmitter(double freq = 3.4e9, double samp_rate = 20e6, double tx_gain = 70, double tx_amp=0.7, std::string device_addr="serial=3123B0D"/*"type=b200,serial=3123B0D"*/);
+        transmitter(double freq = 3.4e9, double samp_rate = 20e6, double tx_gain = 70, double tx_amp=0.7, std::string device_addr="serial=3123B0D,num_recv_frames=700,num_send_frames=700,recv_frame_size=11000,send_frame_size=11000"/*"type=b200,serial=3123B0D"*/);
 
         /*!
          * \brief Constructor for the transmitter that uses the usrp_params struct

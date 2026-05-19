@@ -33,7 +33,7 @@ namespace fun
             m_usrp = uhd::usrp::multi_usrp::make(args);
             //  m_device = m_usrp->get_device();
             // Single channel, no daughterboards on the B200 mini.
-            m_usrp->set_clock_source("internal");
+            m_usrp->set_clock_source("external");
             m_usrp->set_time_source("internal");
             m_usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
             m_usrp->set_tx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
