@@ -1,11 +1,22 @@
-// fec_decoder.h — wraps libRaptorQ for the RX side.
+// fec_decoder.h — RX-side FEC, corrected for the real libRaptorQ API.
+//
+// Real libRaptorQ API (verified):
+//   Decoder(Block_Size, symbol_size, Dec_Report)   // Dec_Report, not Decoder_Type
+//   decoder.add_symbol(iterator&, end, esi)         // returns Error
+//   decoder.decode_bytes(iterator&, end, from, skip) // returns Decoder_written
+//   Dec_Report::PARTIAL_FROM_BEGINNING / PARTIAL_ANY / COMPLETE
+//
+// API exposed to your program:
+//   FecDecoder dec;
+//   auto recovered = dec.process_phy_packet(vector<unsigned char>);
+//   for (auto& rtp : recovered) { ... }
+
 #pragma once
 #include "fec_common.h"
 #include <RaptorQ/RaptorQ_v1_hdr.hpp>
 #include <cstring>
 #include <map>
 #include <memory>
-#include <stdexcept>
 #include <vector>
 
 namespace fec {
@@ -30,67 +41,72 @@ public:
         if (K != SOURCE_SYMBOLS_PER_GEN) return out;
         if (esi >= (1u << 24)) return out;
 
-        if (!m_have_baseline) {
-            m_baseline_gen = gen_id;
-            m_have_baseline = true;
-        }
+        if (!m_have_baseline) { m_baseline_gen = gen_id; m_have_baseline = true; }
         const int16_t age = static_cast<int16_t>(m_baseline_gen - gen_id);
         if (age > 0 && age < 32768) return out;
 
-        auto& g = m_gens[gen_id];
+        GenState& g = m_gens[gen_id];
         if (!g.decoder) g.init();
         if (g.completed) return out;
 
-        constexpr size_t WORDS_PER_SYM = SYMBOL_SIZE / 4;
-        std::vector<uint32_t> sym(WORDS_PER_SYM, 0);
+        // Copy symbol bytes into a working buffer libRaptorQ can consume.
+        std::vector<uint8_t> sym(SYMBOL_SIZE);
         std::memcpy(sym.data(), phy.data() + HEADER_BYTES, SYMBOL_SIZE);
-        auto it = sym.begin();
-        (void)g.decoder->add_symbol(it, sym.end(), esi);
+        auto it  = sym.begin();
+        auto end = sym.end();
+        g.decoder->add_symbol(it, end, esi);
         ++g.symbols_seen;
 
-        if (g.symbols_seen >= SOURCE_SYMBOLS_PER_GEN) {
+        if (g.symbols_seen >= SOURCE_SYMBOLS_PER_GEN)
             attempt_decode(g, out);
-        }
+
         advance_window(gen_id);
         return out;
     }
 
 private:
     struct GenState {
-        using Decoder = RaptorQ__v1::Impl::Decoder<
-            std::vector<uint32_t>::iterator,
-            std::vector<uint32_t>::iterator>;
+        using Decoder = RaptorQ__v1::Decoder<
+            std::vector<uint8_t>::iterator,
+            std::vector<uint8_t>::iterator>;
         std::unique_ptr<Decoder> decoder;
         unsigned symbols_seen = 0;
         bool     completed    = false;
 
         void init() {
-            decoder = std::make_unique<Decoder>(
+            decoder.reset(new Decoder(
                 RaptorQ__v1::Block_Size::Block_32,
                 SYMBOL_SIZE,
-                RaptorQ__v1::Decoder_Type::PARTIAL_FROM_BEGINNING);
+                RaptorQ__v1::Dec_Report::COMPLETE));
         }
     };
 
     void attempt_decode(GenState& g,
                         std::vector<std::vector<unsigned char>>& out) {
-        constexpr size_t WORDS_PER_SYM = SYMBOL_SIZE / 4;
-        std::vector<uint32_t> recovered(
-            SOURCE_SYMBOLS_PER_GEN * WORDS_PER_SYM, 0);
-        auto it = recovered.begin();
-        const auto res = g.decoder->decode_bytes(it, recovered.end(), 0, 0);
-        if (res.written != SOURCE_SYMBOLS_PER_GEN * SYMBOL_SIZE) return;
+        // Tell the decoder no more symbols are coming for this attempt,
+        // then wait for the computation to finish. Without these two calls
+        // decode_bytes returns nothing.
+        g.decoder->end_of_input(RaptorQ__v1::Fill_With_Zeros::NO);
+        auto wait = g.decoder->wait_sync();
+        if (wait.error != RaptorQ__v1::Error::NONE)
+            return;   // not decodable yet (not enough symbols)
+
+        std::vector<uint8_t> recovered(
+            SOURCE_SYMBOLS_PER_GEN * SYMBOL_SIZE, 0);
+        auto it  = recovered.begin();
+        auto end = recovered.end();
+        auto res = g.decoder->decode_bytes(it, end, 0, 0);
+        if (res.written != SOURCE_SYMBOLS_PER_GEN * SYMBOL_SIZE)
+            return;
         g.completed = true;
 
         for (size_t i = 0; i < SOURCE_SYMBOLS_PER_GEN; ++i) {
-            const uint8_t* p = reinterpret_cast<const uint8_t*>(
-                &recovered[i * WORDS_PER_SYM]);
+            const uint8_t* p = &recovered[i * SYMBOL_SIZE];
             uint16_t len_be;
             std::memcpy(&len_be, p, 2);
             const uint16_t len = ntoh16(len_be);
             if (len == 0 || len > MAX_RTP_PAYLOAD) continue;
-            std::vector<unsigned char> rtp(p + 2, p + 2 + len);
-            out.push_back(std::move(rtp));
+            out.emplace_back(p + 2, p + 2 + len);
         }
     }
 
