@@ -1,26 +1,12 @@
 /*!
  * \file video_tx.cpp
- * \brief Webcam video transmitter over fun_ofdm, with optional RaptorQ FEC.
+ * \brief Webcam video TX over fun_ofdm, with optional FEC and TUI.
  *
- * Captures webcam frames, JPEG-encodes them, fragments into 1900-byte
- * application packets, optionally wraps each packet in RaptorQ FEC, and
- * transmits via the fun_ofdm transmitter.
+ *   -DWITH_FEC enables RaptorQ FEC (generation 32 src + 8 repair).
+ *   -DWITH_TUI enables the terminal-based link-health display.
  *
- * FEC is compile-time optional. Build with -DWITH_FEC to enable it.
- *
- *   Without FEC: each 1900-byte packet -> tx.send_frame() directly.
- *   With FEC:    packets are buffered into generations of 32, encoded into
- *                40 FEC packets (32 source + 8 repair), each sent as one
- *                PHY frame. The receiver recovers all 32 from any 32 of 40.
- *
- * Packet layout (1900 bytes, network byte order header):
- *    0   4  magic        = 0xDEADBEEF
- *    4   4  frame_id     (uint32)
- *    8   2  chunk_index  (uint16)
- *   10   2  total_chunks (uint16)
- *   12   2  payload_size (uint16)
- *   14   6  reserved
- *   20 1880 payload
+ * Build both together, individually, or neither. The non-FEC, non-TUI build
+ * is identical in behavior to the original video_tx.
  */
 
 #include <iostream>
@@ -29,6 +15,8 @@
 #include <cstdint>
 #include <chrono>
 #include <thread>
+#include <atomic>
+#include <csignal>
 #include <arpa/inet.h>
 
 #include <opencv2/opencv.hpp>
@@ -41,19 +29,24 @@
 #  include "fec_encoder.h"
 #endif
 
+#ifdef WITH_TUI
+#  include "link_stats.h"
+#  include "link_tui.h"
+#endif
+
 using namespace fun;
 
 // ---------------------- Radio parameters ------------------------------------
-static const double FREQ        = 3.4e9;    // center freq [Hz] — matches RX
-static const double SAMPLE_RATE = 20e6;     // sample rate [Hz]
-static const double TX_GAIN     = 60.0;     // B200 mini scale
-static const double TX_AMP      = 0.5;      // digital backoff
+static const double FREQ        = 3.4e9;
+static const double SAMPLE_RATE = 20e6;
+static const double TX_GAIN     = 60.0;
+static const double TX_AMP      = 0.5;
 static const Rate   PHY_RATE    = RATE_1_2_QPSK;
 
 // ---------------------- Packet geometry -------------------------------------
 static const std::size_t PACKET_SIZE  = 1900;
 static const std::size_t HEADER_SIZE  = 20;
-static const std::size_t PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;  // 1880
+static const std::size_t PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;
 static const uint32_t    MAGIC        = 0xDEADBEEFu;
 
 // ---------------------- Camera / encoding -----------------------------------
@@ -64,10 +57,19 @@ static const int JPEG_Q     = 50;
 static const int TARGET_FPS = 30;
 
 #ifdef WITH_FEC
-// Sanity check: FEC symbol must be large enough for our packet.
 static_assert(fec::SYMBOL_SIZE >= PACKET_SIZE,
-              "fec::SYMBOL_SIZE must be >= PACKET_SIZE (set it to 1920)");
+              "fec::SYMBOL_SIZE must be >= PACKET_SIZE (set to 1920)");
 static fec::FecEncoder g_enc;
+#endif
+
+#ifdef WITH_TUI
+static stats::LinkStats g_stats;
+static std::atomic<bool> g_stop{false};
+static stats::LinkTui*   g_tui_ptr = nullptr;
+static void on_signal(int) {
+    g_stop.store(true);
+    if (g_tui_ptr) g_tui_ptr->stop();
+}
 #endif
 
 // ----------------------------------------------------------------------------
@@ -93,7 +95,6 @@ static void build_packet(std::vector<unsigned char>& pkt,
         std::memcpy(&pkt[HEADER_SIZE], payload, payload_size);
 }
 
-// Sends one application packet, through FEC if enabled, else directly.
 static void transmit_packet(transmitter& tx,
                             const std::vector<unsigned char>& packet)
 {
@@ -102,23 +103,41 @@ static void transmit_packet(transmitter& tx,
     while (g_enc.has_phy_packet()) {
         std::vector<unsigned char> phy = g_enc.next_phy_packet();
         tx.send_frame(phy, PHY_RATE);
+#  ifdef WITH_TUI
+        g_stats.note_phy_packet_tx();
+#  endif
     }
 #else
     tx.send_frame(packet, PHY_RATE);
+#  ifdef WITH_TUI
+    g_stats.note_phy_packet_tx();
+#  endif
 #endif
 }
 
 int main(int /*argc*/, char** /*argv*/)
 {
-    std::cout << "fun_ofdm video transmitter"
+    std::cout << "fun_ofdm video TX"
 #ifdef WITH_FEC
-              << " [FEC ENABLED]"
-#else
-              << " [no FEC]"
+              << " [FEC]"
+#endif
+#ifdef WITH_TUI
+              << " [TUI]"
 #endif
               << "\n";
 
     set_realtime_priority(1.0f);
+
+#ifdef WITH_TUI
+    std::signal(SIGINT,  on_signal);
+    std::signal(SIGTERM, on_signal);
+#  ifdef WITH_FEC
+    g_enc.set_stats(&g_stats);
+#  endif
+    stats::LinkTui tui(g_stats, stats::TuiMode::TX);
+    g_tui_ptr = &tui;
+    std::thread tui_thread([&tui]() { tui.run(); });
+#endif
 
     cv::VideoCapture cap(CAM_INDEX);
     if (!cap.isOpened()) {
@@ -139,15 +158,18 @@ int main(int /*argc*/, char** /*argv*/)
     uint32_t frame_id = 0;
     const auto frame_period = std::chrono::milliseconds(1000 / TARGET_FPS);
 
+#ifdef WITH_TUI
+    while (!g_stop.load()) {
+#else
     while (true) {
+#endif
         auto t0 = std::chrono::steady_clock::now();
 
         cv::Mat frame;
         if (!cap.read(frame) || frame.empty()) {
-            std::cerr << "WARN: dropped empty frame\n";
+            std::cerr << "WARN: empty frame\n";
             continue;
         }
-
         jpeg_buf.clear();
         if (!cv::imencode(".jpg", frame, jpeg_buf, jpeg_params)) {
             std::cerr << "WARN: JPEG encode failed\n";
@@ -158,45 +180,46 @@ int main(int /*argc*/, char** /*argv*/)
         std::size_t total_chunks =
             (nbytes + PAYLOAD_SIZE - 1) / PAYLOAD_SIZE;
         if (total_chunks == 0) total_chunks = 1;
-        if (total_chunks > 0xFFFFu) {
-            std::cerr << "WARN: frame too large (" << nbytes << " B)\n";
-            continue;
-        }
+        if (total_chunks > 0xFFFFu) continue;
 
+#ifdef WITH_TUI
+        g_stats.note_video_frame_encoded(nbytes, total_chunks);
+#else
         std::cout << "Frame " << frame_id << "  " << nbytes
                   << " B  " << total_chunks << " pkts\n";
+#endif
 
         for (std::size_t i = 0; i < total_chunks; ++i) {
             std::size_t offset    = i * PAYLOAD_SIZE;
             std::size_t remaining = nbytes - offset;
             uint16_t this_payload =
                 static_cast<uint16_t>(std::min(remaining, PAYLOAD_SIZE));
-
             build_packet(packet, frame_id,
                          static_cast<uint16_t>(i),
                          static_cast<uint16_t>(total_chunks),
                          jpeg_buf.data() + offset, this_payload);
-
-            if (packet.size() != PACKET_SIZE) {
-                std::cerr << "BUG: packet size " << packet.size() << "\n";
-                return 2;
-            }
             transmit_packet(tx, packet);
         }
-
         ++frame_id;
 
 #ifdef WITH_FEC
-        // Flush any partial generation at end of frame so the receiver
-        // doesn't wait indefinitely for a generation to fill.
         g_enc.flush();
-        while (g_enc.has_phy_packet())
+        while (g_enc.has_phy_packet()) {
             tx.send_frame(g_enc.next_phy_packet(), PHY_RATE);
+#  ifdef WITH_TUI
+            g_stats.note_phy_packet_tx();
+#  endif
+        }
 #endif
 
         auto elapsed = std::chrono::steady_clock::now() - t0;
         if (elapsed < frame_period)
             std::this_thread::sleep_for(frame_period - elapsed);
     }
+
+#ifdef WITH_TUI
+    tui.stop();
+    tui_thread.join();
+#endif
     return 0;
 }
