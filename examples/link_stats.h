@@ -1,0 +1,168 @@
+// link_stats.h — thread-safe counters for the video link.
+//
+// Updated from any thread (atomics for counters), sampled once per second by
+// the TUI thread for rate calculation. No external dependencies.
+
+#pragma once
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <mutex>
+
+namespace stats {
+
+class LinkStats {
+public:
+    LinkStats() : m_start(std::chrono::steady_clock::now()) {}
+
+    // ---- TX-side increments ----
+    void note_video_frame_encoded(size_t jpeg_bytes, unsigned chunks) {
+        m_video_frames_encoded.fetch_add(1, std::memory_order_relaxed);
+        m_jpeg_bytes.fetch_add(jpeg_bytes, std::memory_order_relaxed);
+        m_app_packets_tx.fetch_add(chunks, std::memory_order_relaxed);
+    }
+    void note_fec_gen_encoded(unsigned phy_packets) {
+        m_fec_gens_encoded.fetch_add(1, std::memory_order_relaxed);
+        m_phy_packets_tx.fetch_add(phy_packets, std::memory_order_relaxed);
+    }
+    void note_phy_packet_tx() {
+        m_phy_packets_tx.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // ---- RX-side increments ----
+    void note_phy_packet_rx() {
+        m_phy_packets_rx.fetch_add(1, std::memory_order_relaxed);
+    }
+    void note_phy_packet_rejected() {
+        m_phy_packets_rejected.fetch_add(1, std::memory_order_relaxed);
+    }
+    void note_fec_gen_decoded(unsigned source_used, unsigned repair_used) {
+        m_fec_gens_decoded.fetch_add(1, std::memory_order_relaxed);
+        m_fec_source_used.fetch_add(source_used, std::memory_order_relaxed);
+        m_fec_repair_used.fetch_add(repair_used, std::memory_order_relaxed);
+    }
+    void note_fec_gen_dropped() {
+        m_fec_gens_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    void note_app_packet_rx() {
+        m_app_packets_rx.fetch_add(1, std::memory_order_relaxed);
+    }
+    void note_video_frame_displayed(size_t jpeg_bytes) {
+        m_video_frames_displayed.fetch_add(1, std::memory_order_relaxed);
+        m_jpeg_bytes_rx.fetch_add(jpeg_bytes, std::memory_order_relaxed);
+    }
+    void note_video_frame_dropped() {
+        m_video_frames_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // ---- Snapshot for the TUI ----
+    struct Snapshot {
+        // Cumulative
+        uint64_t video_frames_encoded = 0;
+        uint64_t video_frames_displayed = 0;
+        uint64_t video_frames_dropped = 0;
+        uint64_t app_packets_tx = 0;
+        uint64_t app_packets_rx = 0;
+        uint64_t phy_packets_tx = 0;
+        uint64_t phy_packets_rx = 0;
+        uint64_t phy_packets_rejected = 0;
+        uint64_t fec_gens_encoded = 0;
+        uint64_t fec_gens_decoded = 0;
+        uint64_t fec_gens_dropped = 0;
+        uint64_t fec_source_used = 0;
+        uint64_t fec_repair_used = 0;
+        uint64_t jpeg_bytes = 0;
+        uint64_t jpeg_bytes_rx = 0;
+        // Derived per-second rates
+        double video_fps_tx = 0.0;
+        double video_fps_rx = 0.0;
+        double phy_pps_tx = 0.0;
+        double phy_pps_rx = 0.0;
+        double app_kbps_tx = 0.0;
+        double app_kbps_rx = 0.0;
+        double fec_repair_pct = 0.0;
+        double rejection_pct = 0.0;
+        double uptime_s = 0.0;
+    };
+
+    Snapshot sample() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        Snapshot s;
+        s.video_frames_encoded   = m_video_frames_encoded.load();
+        s.video_frames_displayed = m_video_frames_displayed.load();
+        s.video_frames_dropped   = m_video_frames_dropped.load();
+        s.app_packets_tx         = m_app_packets_tx.load();
+        s.app_packets_rx         = m_app_packets_rx.load();
+        s.phy_packets_tx         = m_phy_packets_tx.load();
+        s.phy_packets_rx         = m_phy_packets_rx.load();
+        s.phy_packets_rejected   = m_phy_packets_rejected.load();
+        s.fec_gens_encoded       = m_fec_gens_encoded.load();
+        s.fec_gens_decoded       = m_fec_gens_decoded.load();
+        s.fec_gens_dropped       = m_fec_gens_dropped.load();
+        s.fec_source_used        = m_fec_source_used.load();
+        s.fec_repair_used        = m_fec_repair_used.load();
+        s.jpeg_bytes             = m_jpeg_bytes.load();
+        s.jpeg_bytes_rx          = m_jpeg_bytes_rx.load();
+
+        const auto now = std::chrono::steady_clock::now();
+        s.uptime_s = std::chrono::duration<double>(now - m_start).count();
+
+        const double dt = std::chrono::duration<double>(now - m_last_t).count();
+        if (m_have_last && dt > 0.001) {
+            s.video_fps_tx = (s.video_frames_encoded   - m_last_vft) / dt;
+            s.video_fps_rx = (s.video_frames_displayed - m_last_vfr) / dt;
+            s.phy_pps_tx   = (s.phy_packets_tx - m_last_phy_tx) / dt;
+            s.phy_pps_rx   = (s.phy_packets_rx - m_last_phy_rx) / dt;
+            s.app_kbps_tx  = ((s.jpeg_bytes    - m_last_jb)   * 8.0 / 1000.0) / dt;
+            s.app_kbps_rx  = ((s.jpeg_bytes_rx - m_last_jbrx) * 8.0 / 1000.0) / dt;
+            const uint64_t total = (s.fec_source_used + s.fec_repair_used)
+                                 - (m_last_src + m_last_rep);
+            const uint64_t reps  = s.fec_repair_used - m_last_rep;
+            s.fec_repair_pct = (total > 0) ? (100.0 * reps / total) : 0.0;
+            const uint64_t seen = (s.phy_packets_rx + s.phy_packets_rejected)
+                                - (m_last_phy_rx + m_last_phy_rej);
+            const uint64_t rej  = s.phy_packets_rejected - m_last_phy_rej;
+            s.rejection_pct = (seen > 0) ? (100.0 * rej / seen) : 0.0;
+        }
+        m_last_vft     = s.video_frames_encoded;
+        m_last_vfr     = s.video_frames_displayed;
+        m_last_phy_tx  = s.phy_packets_tx;
+        m_last_phy_rx  = s.phy_packets_rx;
+        m_last_phy_rej = s.phy_packets_rejected;
+        m_last_jb      = s.jpeg_bytes;
+        m_last_jbrx    = s.jpeg_bytes_rx;
+        m_last_src     = s.fec_source_used;
+        m_last_rep     = s.fec_repair_used;
+        m_last_t       = now;
+        m_have_last    = true;
+        return s;
+    }
+
+private:
+    std::atomic<uint64_t> m_video_frames_encoded{0};
+    std::atomic<uint64_t> m_video_frames_displayed{0};
+    std::atomic<uint64_t> m_video_frames_dropped{0};
+    std::atomic<uint64_t> m_app_packets_tx{0};
+    std::atomic<uint64_t> m_app_packets_rx{0};
+    std::atomic<uint64_t> m_phy_packets_tx{0};
+    std::atomic<uint64_t> m_phy_packets_rx{0};
+    std::atomic<uint64_t> m_phy_packets_rejected{0};
+    std::atomic<uint64_t> m_fec_gens_encoded{0};
+    std::atomic<uint64_t> m_fec_gens_decoded{0};
+    std::atomic<uint64_t> m_fec_gens_dropped{0};
+    std::atomic<uint64_t> m_fec_source_used{0};
+    std::atomic<uint64_t> m_fec_repair_used{0};
+    std::atomic<uint64_t> m_jpeg_bytes{0};
+    std::atomic<uint64_t> m_jpeg_bytes_rx{0};
+
+    std::mutex m_mu;
+    std::chrono::steady_clock::time_point m_start;
+    std::chrono::steady_clock::time_point m_last_t;
+    bool m_have_last = false;
+    uint64_t m_last_vft = 0, m_last_vfr = 0;
+    uint64_t m_last_phy_tx = 0, m_last_phy_rx = 0, m_last_phy_rej = 0;
+    uint64_t m_last_jb = 0, m_last_jbrx = 0;
+    uint64_t m_last_src = 0, m_last_rep = 0;
+};
+
+}  // namespace stats
