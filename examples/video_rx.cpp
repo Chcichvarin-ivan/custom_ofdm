@@ -1,13 +1,12 @@
 /*!
  * \file video_rx.cpp
- * \brief Webcam video receiver over fun_ofdm, with optional RaptorQ FEC.
+ * \brief Webcam video RX over fun_ofdm, with optional FEC and TUI.
  *
- * Receives PHY frames via the fun_ofdm receiver callback. If FEC is enabled,
- * each PHY frame is fed to the RaptorQ decoder, which emits recovered
- * 1900-byte application packets once a generation is decodable. Those
- * packets then go through the same JPEG reassembly path as the non-FEC build.
+ *   -DWITH_FEC enables RaptorQ FEC decoding (must match TX).
+ *   -DWITH_TUI enables the terminal-based link-health display.
  *
- * Build with -DWITH_FEC to enable FEC (must match the TX build).
+ * The TUI runs in its own thread; OpenCV display remains in the main thread.
+ * Stats are updated from the fun_ofdm receiver callback thread.
  */
 
 #include <iostream>
@@ -20,6 +19,8 @@
 #include <cstdint>
 #include <chrono>
 #include <atomic>
+#include <csignal>
+#include <thread>
 #include <arpa/inet.h>
 
 #include <opencv2/opencv.hpp>
@@ -32,23 +33,33 @@
 #  include "fec_decoder.h"
 #endif
 
+#ifdef WITH_TUI
+#  include "link_stats.h"
+#  include "link_tui.h"
+#endif
+
 using namespace fun;
 
 // ---------------------- Radio parameters (must match TX) --------------------
-static const double FREQ        = 3.4e9;    // matches TX
+static const double FREQ        = 3.4e9;
 static const double SAMPLE_RATE = 20e6;
-static const double RX_GAIN     = 20.0;     // with LNA; sweep 15-30
+static const double RX_GAIN     = 20.0;
 
 // ---------------------- Packet geometry (must match TX) --------------------
 static const std::size_t PACKET_SIZE  = 1900;
 static const std::size_t HEADER_SIZE  = 20;
-static const std::size_t PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;  // 1880
+static const std::size_t PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;
 static const uint32_t    MAGIC        = 0xDEADBEEFu;
 
 #ifdef WITH_FEC
 static_assert(fec::SYMBOL_SIZE >= PACKET_SIZE,
-              "fec::SYMBOL_SIZE must be >= PACKET_SIZE (set it to 1920)");
+              "fec::SYMBOL_SIZE must be >= PACKET_SIZE (set to 1920)");
 static fec::FecDecoder g_dec;
+#endif
+
+#ifdef WITH_TUI
+static stats::LinkStats g_stats;
+static stats::LinkTui*  g_tui_ptr = nullptr;
 #endif
 
 // ---------------------------------------------------------------------------
@@ -69,6 +80,13 @@ static std::map<uint32_t, PartialFrame> g_partials;
 static uint32_t g_last_displayed_frame_id = 0;
 static bool     g_have_displayed = false;
 
+static void on_signal(int) {
+    g_stop.store(true);
+#ifdef WITH_TUI
+    if (g_tui_ptr) g_tui_ptr->stop();
+#endif
+}
+
 // ---------------------------------------------------------------------------
 static void flush_frame(uint32_t frame_id, PartialFrame& pf)
 {
@@ -88,12 +106,14 @@ static void flush_frame(uint32_t frame_id, PartialFrame& pf)
 }
 
 // ---------------------------------------------------------------------------
-// Process ONE recovered application packet (1900 bytes) into the reassembly
-// table. This is the same logic for FEC and non-FEC paths.
 static void process_app_packet(const std::vector<unsigned char>& pkt)
 {
-    if (pkt.size() != PACKET_SIZE) return;
-
+    if (pkt.size() != PACKET_SIZE) {
+#ifdef WITH_TUI
+        g_stats.note_phy_packet_rejected();
+#endif
+        return;
+    }
     uint32_t magic_n, frame_id_n;
     uint16_t chunk_idx_n, total_n, payload_sz_n;
     std::memcpy(&magic_n,      &pkt[0],  4);
@@ -102,7 +122,16 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
     std::memcpy(&total_n,      &pkt[10], 2);
     std::memcpy(&payload_sz_n, &pkt[12], 2);
 
-    if (ntohl(magic_n) != MAGIC) return;
+    if (ntohl(magic_n) != MAGIC) {
+#ifdef WITH_TUI
+        g_stats.note_phy_packet_rejected();
+#endif
+        return;
+    }
+
+#ifdef WITH_TUI
+    g_stats.note_app_packet_rx();
+#endif
 
     uint32_t frame_id     = ntohl(frame_id_n);
     uint16_t chunk_index  = ntohs(chunk_idx_n);
@@ -144,51 +173,74 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
 static void rx_callback(std::vector<std::vector<unsigned char>> packets)
 {
     for (auto& pkt : packets) {
+#ifdef WITH_TUI
+        g_stats.note_phy_packet_rx();
+#endif
 #ifdef WITH_FEC
-        // Each PHY frame is a FEC packet. Feed it to the decoder; when a
-        // generation completes, we get back the original application packets.
         std::vector<std::vector<unsigned char>> recovered =
             g_dec.process_phy_packet(pkt);
-        for (auto& app : recovered)
-            process_app_packet(app);
+        for (auto& app : recovered) process_app_packet(app);
 #else
         process_app_packet(pkt);
 #endif
     }
 
-    // Garbage-collect stale partials.
+    // Garbage-collect stale partials
     auto now = std::chrono::steady_clock::now();
     for (auto it = g_partials.begin(); it != g_partials.end(); ) {
         bool too_old = (now - it->second.first_seen) > std::chrono::seconds(1);
         bool superseded = g_have_displayed &&
                           (it->first + 30 < g_last_displayed_frame_id);
-        if (too_old || superseded) it = g_partials.erase(it);
-        else ++it;
+        if (too_old || superseded) {
+#ifdef WITH_TUI
+            g_stats.note_video_frame_dropped();
+#endif
+            it = g_partials.erase(it);
+        } else ++it;
     }
 }
 
 // ---------------------------------------------------------------------------
 int main(int /*argc*/, char** /*argv*/)
 {
-    std::cout << "fun_ofdm video receiver"
+    std::cout << "fun_ofdm video RX"
 #ifdef WITH_FEC
-              << " [FEC ENABLED]"
-#else
-              << " [no FEC]"
+              << " [FEC]"
+#endif
+#ifdef WITH_TUI
+              << " [TUI]"
 #endif
               << "\n";
 
+    std::signal(SIGINT,  on_signal);
+    std::signal(SIGTERM, on_signal);
+
     set_realtime_priority(1.0f);
+
+#ifdef WITH_TUI
+#  ifdef WITH_FEC
+    g_dec.set_stats(&g_stats);
+#  endif
+    stats::LinkTui tui(g_stats, stats::TuiMode::RX);
+    g_tui_ptr = &tui;
+    std::thread tui_thread([&tui]() { tui.run(); });
+#endif
 
     receiver rx(&rx_callback, FREQ, SAMPLE_RATE, RX_GAIN,
                 "type=b200,serial=314C000,num_recv_frames=700,"
                 "num_send_frames=700,recv_frame_size=11000,"
                 "send_frame_size=11000");
 
+#ifdef WITH_TUI
+    // With the TUI taking the terminal, we don't want OpenCV to spam the
+    // terminal too. But we still need a window for the video.
+    cv::namedWindow("fun_ofdm video", cv::WINDOW_AUTOSIZE);
+#else
     cv::namedWindow("fun_ofdm video", cv::WINDOW_AUTOSIZE);
     std::cout << "Press 'q' in the video window to quit.\n";
+#endif
 
-    while (!g_stop) {
+    while (!g_stop.load()) {
         std::vector<unsigned char> jpeg;
         {
             std::unique_lock<std::mutex> lk(g_queue_mu);
@@ -203,11 +255,17 @@ int main(int /*argc*/, char** /*argv*/)
 
         if (!jpeg.empty()) {
             cv::Mat frame = cv::imdecode(jpeg, cv::IMREAD_COLOR);
-            if (!frame.empty())
+            if (!frame.empty()) {
                 cv::imshow("fun_ofdm video", frame);
-            else
+#ifdef WITH_TUI
+                g_stats.note_video_frame_displayed(jpeg.size());
+#endif
+            } else {
+#ifndef WITH_TUI
                 std::cerr << "WARN: JPEG decode failed ("
                           << jpeg.size() << " B)\n";
+#endif
+            }
         }
 
         int key = cv::waitKey(1);
@@ -216,5 +274,10 @@ int main(int /*argc*/, char** /*argv*/)
 
     rx.pause();
     cv::destroyAllWindows();
+
+#ifdef WITH_TUI
+    tui.stop();
+    tui_thread.join();
+#endif
     return 0;
 }
