@@ -14,6 +14,7 @@
 
 #pragma once
 #include "fec_common.h"
+#include "link_stats.h"
 #include <RaptorQ/RaptorQ_v1_hdr.hpp>
 #include <cstring>
 #include <deque>
@@ -27,6 +28,8 @@ public:
     FecEncoder() : m_gen_id(0) {
         m_buffered.reserve(SOURCE_SYMBOLS_PER_GEN);
     }
+
+    void set_stats(stats::LinkStats* s) { m_stats = s; }
 
     void add_rtp_packet(const std::vector<unsigned char>& rtp) {
         if (rtp.size() > MAX_RTP_PAYLOAD)
@@ -91,6 +94,7 @@ private:
             encoder.encode(it, end, esi);
             m_outbox.push_back(build_phy_packet(esi, sym_out));
         }
+        if (m_stats) m_stats->note_fec_gen_encoded(SYMBOLS_PER_GEN);
     }
 
     std::vector<unsigned char>
@@ -109,6 +113,7 @@ private:
     uint16_t m_gen_id;
     std::vector<std::vector<uint8_t>> m_buffered;
     std::deque<std::vector<unsigned char>> m_outbox;
+    stats::LinkStats* m_stats = nullptr;
 };
 
 }  // namespace fec

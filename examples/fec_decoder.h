@@ -13,6 +13,7 @@
 
 #pragma once
 #include "fec_common.h"
+#include "link_stats.h"
 #include <RaptorQ/RaptorQ_v1_hdr.hpp>
 #include <cstring>
 #include <map>
@@ -26,6 +27,8 @@ public:
     static constexpr unsigned WINDOW_GENERATIONS = 4;
 
     FecDecoder() : m_have_baseline(false), m_baseline_gen(0) {}
+
+    void set_stats(stats::LinkStats* s) { m_stats = s; }
 
     std::vector<std::vector<unsigned char>>
     process_phy_packet(const std::vector<unsigned char>& phy) {
@@ -100,6 +103,16 @@ private:
             return;
         g.completed = true;
 
+        if (m_stats) {
+            // We can't easily know source vs repair from the decoder alone;
+            // approximate: source_used = min(symbols_seen, K), rest = repair.
+            unsigned src = std::min<unsigned>(g.symbols_seen,
+                                              SOURCE_SYMBOLS_PER_GEN);
+            unsigned rep = (g.symbols_seen > SOURCE_SYMBOLS_PER_GEN)
+                         ? (g.symbols_seen - SOURCE_SYMBOLS_PER_GEN) : 0;
+            m_stats->note_fec_gen_decoded(src, rep);
+        }
+
         for (size_t i = 0; i < SOURCE_SYMBOLS_PER_GEN; ++i) {
             const uint8_t* p = &recovered[i * SYMBOL_SIZE];
             uint16_t len_be;
@@ -120,8 +133,11 @@ private:
             for (auto it = m_gens.begin(); it != m_gens.end();) {
                 const int16_t a =
                     static_cast<int16_t>(new_baseline - it->first);
-                if (a > 0) it = m_gens.erase(it);
-                else ++it;
+                if (a > 0) {
+                    if (!it->second.completed && m_stats)
+                        m_stats->note_fec_gen_dropped();
+                    it = m_gens.erase(it);
+                } else ++it;
             }
             m_baseline_gen = new_baseline;
         }
@@ -130,6 +146,7 @@ private:
     bool     m_have_baseline;
     uint16_t m_baseline_gen;
     std::map<uint16_t, GenState> m_gens;
+    stats::LinkStats* m_stats = nullptr;
 };
 
 }  // namespace fec
