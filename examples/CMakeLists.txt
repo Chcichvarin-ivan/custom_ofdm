@@ -11,15 +11,19 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/src)
 
 ########################################################################
-# FEC configuration (libRaptorQ is header-only)
+# FEC + TUI configuration
 #
-#   Enable:   cmake -DWITH_FEC=ON -DLIBRAPTORQ_DIR=/path/to/libRaptorQ/src ..
-#   Disable:  cmake ..   (default)
+#   cmake ..                                          # baseline, no extras
+#   cmake -DWITH_TUI=ON ..                            # terminal stats only
+#   cmake -DWITH_FEC=ON -DLIBRAPTORQ_DIR=... ..       # FEC only
+#   cmake -DWITH_FEC=ON -DWITH_TUI=ON -DLIBRAPTORQ_DIR=... ..   # both
 #
-# The FEC shim headers (fec_common.h, fec_encoder.h, fec_decoder.h) are
-# expected in this examples/ directory alongside video_tx.cpp / video_rx.cpp.
+# The shim headers (fec_*.h, link_*.h) live in this examples/ directory.
 ########################################################################
 option(WITH_FEC "Build video bridges with RaptorQ FEC" OFF)
+option(WITH_TUI "Build video bridges with terminal link-health display" OFF)
+
+find_package(Threads REQUIRED)
 
 if(WITH_FEC)
     set(LIBRAPTORQ_DIR "" CACHE PATH
@@ -49,9 +53,11 @@ if(WITH_FEC)
     message(STATUS "  libRaptorQ: ${LIBRAPTORQ_DIR}")
     message(STATUS "  Eigen3:     ${EIGEN3_INCLUDE_DIR}")
 
-    find_package(Threads REQUIRED)
-endif()
 
+endif()
+if(WITH_TUI)
+    message(STATUS "TUI enabled")
+endif()
 ########################################################################
 # Original test executables
 ########################################################################
@@ -71,7 +77,7 @@ target_link_libraries(receiver    fun_ofdm)
 target_link_libraries(transceiver fun_ofdm)
 
 ########################################################################
-# Video bridges (FEC optional)
+# Video bridges — FEC and TUI both optional
 ########################################################################
 add_executable(video_tx video_tx.cpp)
 add_executable(video_rx video_rx.cpp)
@@ -79,16 +85,22 @@ add_executable(video_rx video_rx.cpp)
 target_link_libraries(video_tx fun_ofdm ${OpenCV_LIBS})
 target_link_libraries(video_rx fun_ofdm ${OpenCV_LIBS})
 
-if(WITH_FEC)
-    foreach(tgt video_tx video_rx)
-        # libRaptorQ header-only needs C++14 and -include cstdint for modern gcc
-        target_compile_definitions(${tgt} PRIVATE WITH_FEC)
+# Things that apply when either FEC or TUI is on (C++14, threads, local hdrs)
+foreach(tgt video_tx video_rx)
+    if(WITH_FEC OR WITH_TUI)
         target_compile_features(${tgt} PRIVATE cxx_std_14)
+        target_include_directories(${tgt} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(${tgt} Threads::Threads)
+    endif()
+    if(WITH_FEC)
+        target_compile_definitions(${tgt} PRIVATE WITH_FEC)
         target_compile_options(${tgt} PRIVATE -include cstdint)
         target_include_directories(${tgt} PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}     # for fec_*.h next to the sources
                 ${LIBRAPTORQ_DIR}
                 ${EIGEN3_INCLUDE_DIR})
-        target_link_libraries(${tgt} Threads::Threads)
-    endforeach()
-endif()
+    endif()
+    if(WITH_TUI)
+        target_compile_definitions(${tgt} PRIVATE WITH_TUI)
+    endif()
+endforeach()
