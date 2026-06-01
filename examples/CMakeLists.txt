@@ -22,6 +22,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src)
 ########################################################################
 option(WITH_FEC "Build video bridges with RaptorQ FEC" OFF)
 option(WITH_TUI "Build video bridges with terminal link-health display" OFF)
+option(WITH_OVERLAY "Build video_rx with on-video HUD overlay" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -87,7 +88,7 @@ target_link_libraries(video_rx fun_ofdm ${OpenCV_LIBS})
 
 # Things that apply when either FEC or TUI is on (C++14, threads, local hdrs)
 foreach(tgt video_tx video_rx)
-    if(WITH_FEC OR WITH_TUI)
+    if(WITH_FEC OR WITH_TUI OR WITH_OVERLAY)
         target_compile_features(${tgt} PRIVATE cxx_std_14)
         target_include_directories(${tgt} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR})
@@ -104,3 +105,7 @@ foreach(tgt video_tx video_rx)
         target_compile_definitions(${tgt} PRIVATE WITH_TUI)
     endif()
 endforeach()
+
+if(WITH_OVERLAY)
+    target_compile_definitions(video_rx PRIVATE WITH_OVERLAY)
+endif()
