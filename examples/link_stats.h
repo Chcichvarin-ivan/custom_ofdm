@@ -10,7 +10,7 @@
 #include <mutex>
 
 namespace stats {
-
+    enum class TuiMode { TX, RX };
 class LinkStats {
 public:
     LinkStats() : m_start(std::chrono::steady_clock::now()) {}

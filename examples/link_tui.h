@@ -18,7 +18,7 @@
 
 namespace stats {
 
-enum class TuiMode { TX, RX };
+
 
 class LinkTui {
 public:
