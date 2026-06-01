@@ -38,6 +38,13 @@
 #  include "link_tui.h"
 #endif
 
+#ifdef WITH_OVERLAY
+#  ifndef WITH_TUI
+#    include "link_stats.h"   // ensure LinkStats is included
+#  endif
+#  include "link_overlay.h"
+#endif
+
 using namespace fun;
 
 // ---------------------- Radio parameters (must match TX) --------------------
@@ -57,11 +64,15 @@ static_assert(fec::SYMBOL_SIZE >= PACKET_SIZE,
 static fec::FecDecoder g_dec;
 #endif
 
-#ifdef WITH_TUI
+#if defined(WITH_TUI) || defined(WITH_OVERLAY)
 static stats::LinkStats g_stats;
 static stats::LinkTui*  g_tui_ptr = nullptr;
 #endif
 
+
+#if defined(WITH_TUI) || defined(WITH_OVERLAY)
+#  define WITH_STATS
+#endif
 // ---------------------------------------------------------------------------
 struct PartialFrame {
     uint16_t total_chunks = 0;
@@ -225,6 +236,9 @@ int main(int /*argc*/, char** /*argv*/)
     g_tui_ptr = &tui;
     std::thread tui_thread([&tui]() { tui.run(); });
 #endif
+#ifdef WITH_OVERLAY
+    stats::LinkOverlay overlay(g_stats, stats::TuiMode::RX);
+#endif
 
     receiver rx(&rx_callback, FREQ, SAMPLE_RATE, RX_GAIN,
                 "type=b200,serial=314C000,num_recv_frames=700,"
@@ -256,6 +270,9 @@ int main(int /*argc*/, char** /*argv*/)
         if (!jpeg.empty()) {
             cv::Mat frame = cv::imdecode(jpeg, cv::IMREAD_COLOR);
             if (!frame.empty()) {
+#ifdef WITH_OVERLAY
+                overlay.render(frame);
+#endif
                 cv::imshow("fun_ofdm video", frame);
 #ifdef WITH_TUI
                 g_stats.note_video_frame_displayed(jpeg.size());
