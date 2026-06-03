@@ -203,7 +203,17 @@ int main(int /*argc*/, char** /*argv*/)
         ++frame_id;
 
 #ifdef WITH_FEC
-        g_enc.flush();
+        // Do NOT flush every frame — that pads every generation and triples
+        // airtime. Only flush if too much time passed since last send, so a
+        // stalled stream still drains. Otherwise let generations fill across
+        // frames at their natural 32-packet boundary.
+        static auto last_flush = std::chrono::steady_clock::now();
+        auto now_f = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                now_f - last_flush).count() > 200) {
+            g_enc.flush();
+            last_flush = now_f;
+                }
         while (g_enc.has_phy_packet()) {
             tx.send_frame(g_enc.next_phy_packet(), PHY_RATE);
 #  ifdef WITH_TUI
