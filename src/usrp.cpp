@@ -45,7 +45,7 @@ namespace fun
             m_usrp->set_tx_freq(tune);
             m_usrp->set_rx_freq(tune);
 
-            m_usrp->set_rx_agc(false);
+
             // Gain ranges are very different from the XCVR2450:
             // TX 0–89.75 dB, RX 0–76 dB on the B200 mini.
             m_usrp->set_tx_gain(params.tx_gain);  // start around 70
@@ -54,6 +54,7 @@ namespace fun
             m_usrp->set_tx_antenna("TX/RX");
             m_usrp->set_rx_antenna("RX2");  // separate RX port; better isolation than TX/RX
 
+        //m_usrp->set_rx_agc(true);
             // Set analog filter bandwidth to match the OFDM signal width.
             m_usrp->set_tx_bandwidth(params.rate * 1.5);
             m_usrp->set_rx_bandwidth(params.rate * 1.5);
