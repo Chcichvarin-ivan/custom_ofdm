@@ -271,9 +271,9 @@ namespace fun
         memcpy(&given_crc, &decoded[2 + header.length], 4);
 
         // Verify the CRC
-        if (header.length != 1900)//(given_crc != calculated_crc)
+        if (given_crc != calculated_crc)
         {
-            std::cerr << "Invalid CRC (length " << header.length << ")" << std::endl;
+            //std::cerr << "Invalid CRC (length " << header.length << ")" << std::endl;
             // Indicate failure
             return false;
         }
