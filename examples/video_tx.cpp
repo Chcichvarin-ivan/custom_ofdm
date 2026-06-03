@@ -39,9 +39,9 @@ using namespace fun;
 // ---------------------- Radio parameters ------------------------------------
 static const double FREQ        = 3.4e9;
 static const double SAMPLE_RATE = 20e6;
-static const double TX_GAIN     = 60.0;
-static const double TX_AMP      = 0.5;
-static const Rate   PHY_RATE    = RATE_1_2_QPSK;
+static const double TX_GAIN     = 70.0;
+static const double TX_AMP      = 0.6;
+static const Rate   PHY_RATE    =   RATE_1_2_BPSK; //RATE_1_2_QPSK;
 
 // ---------------------- Packet geometry -------------------------------------
 static const std::size_t PACKET_SIZE  = 1900;
