@@ -35,6 +35,18 @@ namespace fun
             // Single channel, no daughterboards on the B200 mini.
             m_usrp->set_clock_source("external");
             m_usrp->set_time_source("internal");
+
+            // After set_clock_source("external"):
+            bool locked = false;
+            auto start = std::chrono::steady_clock::now();
+            while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - start).count() < 1500) {
+                    uhd::sensor_value_t ref = m_usrp->get_mboard_sensor("ref_locked");
+                    if (ref.to_bool()) { locked = true; break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                   }
+            std::cerr << "Ref locked: " << (locked ? "yes" : "NO") << std::endl;
+
             m_usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
             m_usrp->set_tx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
 
@@ -56,8 +68,8 @@ namespace fun
 
         //m_usrp->set_rx_agc(true);
             // Set analog filter bandwidth to match the OFDM signal width.
-            m_usrp->set_tx_bandwidth(params.rate * 1.5);
-            m_usrp->set_rx_bandwidth(params.rate * 1.5);
+            m_usrp->set_tx_bandwidth(params.rate * 2);//1.5);
+            m_usrp->set_rx_bandwidth(params.rate * 2);//1.5);
 
             m_usrp->set_rx_dc_offset(true);      // enable auto DC offset correction
             m_usrp->set_rx_iq_balance(true,uhd::usrp::multi_usrp::ALL_CHANS);     // enable auto IQ balance correction
@@ -71,8 +83,8 @@ namespace fun
             // Start the RX stream continuously; it stays running.
             uhd::stream_cmd_t stream_cmd(
                         uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
-            const auto sensor = m_usrp->get_mboard_sensor("ref_locked");
-            std::cerr << "Ref locked: " << sensor.to_pp_string() << std::endl;
+            //const auto sensor = m_usrp->get_mboard_sensor("ref_locked");
+            //std::cerr << "Ref locked: " << sensor.to_pp_string() << std::endl;
             stream_cmd.stream_now = true;
             m_rx_streamer->issue_stream_cmd(stream_cmd);
 
