@@ -23,6 +23,7 @@ include_directories(${PROJECT_SOURCE_DIR}/src)
 option(WITH_FEC "Build video bridges with RaptorQ FEC" OFF)
 option(WITH_TUI "Build video bridges with terminal link-health display" OFF)
 option(WITH_OVERLAY "Build video_rx with on-video HUD overlay" OFF)
+option(WITH_DIAG "Build video_rx with the RSSI/error diagnostic thread" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -108,4 +109,11 @@ endforeach()
 
 if(WITH_OVERLAY)
     target_compile_definitions(video_rx PRIVATE WITH_OVERLAY)
+endif()
+
+if(WITH_DIAG)
+         target_compile_definitions(video_rx PRIVATE WITH_DIAG)
+         # video_rx already links fun_ofdm which brings UHD; if you get UHD
+         # header errors, also:  find_package(UHD REQUIRED) and
+         # target_link_libraries(video_rx ${UHD_LIBRARIES})
 endif()

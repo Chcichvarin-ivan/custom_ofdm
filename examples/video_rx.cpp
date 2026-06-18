@@ -38,11 +38,20 @@
 #  include "link_tui.h"
 #endif
 
-#ifdef WITH_OVERLAY
-#  ifndef WITH_TUI
-#    include "link_stats.h"   // ensure LinkStats is included
-#  endif
-#  include "link_overlay.h"
+// Diagnostics (RSSI + error-rate). Needs the stats object too, so pull in
+// link_stats.h if DIAG is on without TUI.
+#if defined(WITH_DIAG) && !defined(WITH_TUI)
+#  include "link_stats.h"
+#endif
+#ifdef WITH_DIAG
+#  include "link_diagnostics.h"
+#endif
+
+// Convenience: WITH_STATS is true when ANY consumer of LinkStats is enabled.
+// All g_stats.note_*() counter calls are guarded by this so the counters are
+// populated for the TUI and/or the diagnostic thread.
+#if defined(WITH_TUI) || defined(WITH_DIAG)
+#  define WITH_STATS
 #endif
 
 using namespace fun;
@@ -64,15 +73,13 @@ static_assert(fec::SYMBOL_SIZE >= PACKET_SIZE,
 static fec::FecDecoder g_dec;
 #endif
 
-#if defined(WITH_TUI) || defined(WITH_OVERLAY)
+#if defined(WITH_TUI) || defined(WITH_DIAG)
 static stats::LinkStats g_stats;
+#endif
+#ifdef WITH_TUI
 static stats::LinkTui*  g_tui_ptr = nullptr;
 #endif
 
-
-#if defined(WITH_TUI) || defined(WITH_OVERLAY)
-#  define WITH_STATS
-#endif
 // ---------------------------------------------------------------------------
 struct PartialFrame {
     uint16_t total_chunks = 0;
@@ -120,7 +127,7 @@ static void flush_frame(uint32_t frame_id, PartialFrame& pf)
 static void process_app_packet(const std::vector<unsigned char>& pkt)
 {
     if (pkt.size() != PACKET_SIZE) {
-#ifdef WITH_TUI
+#if defined(WITH_TUI) || defined(WITH_DIAG)
         g_stats.note_phy_packet_rejected();
 #endif
         return;
@@ -134,13 +141,13 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
     std::memcpy(&payload_sz_n, &pkt[12], 2);
 
     if (ntohl(magic_n) != MAGIC) {
-#ifdef WITH_TUI
+#if defined(WITH_TUI) || defined(WITH_DIAG)
         g_stats.note_phy_packet_rejected();
 #endif
         return;
     }
 
-#ifdef WITH_TUI
+#if defined(WITH_TUI) || defined(WITH_DIAG)
     g_stats.note_app_packet_rx();
 #endif
 
@@ -184,7 +191,7 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
 static void rx_callback(std::vector<std::vector<unsigned char>> packets)
 {
     for (auto& pkt : packets) {
-#ifdef WITH_TUI
+#if defined(WITH_TUI) || defined(WITH_DIAG)
         g_stats.note_phy_packet_rx();
 #endif
 #ifdef WITH_FEC
@@ -203,7 +210,7 @@ static void rx_callback(std::vector<std::vector<unsigned char>> packets)
         bool superseded = g_have_displayed &&
                           (it->first + 30 < g_last_displayed_frame_id);
         if (too_old || superseded) {
-#ifdef WITH_TUI
+#if defined(WITH_TUI) || defined(WITH_DIAG)
             g_stats.note_video_frame_dropped();
 #endif
             it = g_partials.erase(it);
@@ -221,6 +228,9 @@ int main(int /*argc*/, char** /*argv*/)
 #ifdef WITH_TUI
               << " [TUI]"
 #endif
+#ifdef WITH_DIAG
+              << " [DIAG]"
+#endif
               << "\n";
 
     std::signal(SIGINT,  on_signal);
@@ -236,14 +246,22 @@ int main(int /*argc*/, char** /*argv*/)
     g_tui_ptr = &tui;
     std::thread tui_thread([&tui]() { tui.run(); });
 #endif
-#ifdef WITH_OVERLAY
-    stats::LinkOverlay overlay(g_stats, stats::TuiMode::RX);
-#endif
 
     receiver rx(&rx_callback, FREQ, SAMPLE_RATE, RX_GAIN,
                 "type=b200,serial=314C000,num_recv_frames=700,"
                 "num_send_frames=700,recv_frame_size=11000,"
                 "send_frame_size=11000");
+
+#ifdef WITH_DIAG
+#  ifdef WITH_FEC
+    g_dec.set_stats(&g_stats);   // FEC decode/drop counts feed the error rate
+#  endif
+    // Pull the multi_usrp handle out of the receiver to read RSSI. This call
+    // requires the get_multi_usrp() accessor chain added to usrp.h,
+    // receiver_chain.h, and receiver.h (see DIAGNOSTICS_INTEGRATION notes).
+    stats::LinkDiagnostics diag(rx.get_multi_usrp(), g_stats, /*chan=*/0);
+    std::thread diag_thread([&diag]() { diag.run(); });
+#endif
 
 #ifdef WITH_TUI
     // With the TUI taking the terminal, we don't want OpenCV to spam the
@@ -270,11 +288,8 @@ int main(int /*argc*/, char** /*argv*/)
         if (!jpeg.empty()) {
             cv::Mat frame = cv::imdecode(jpeg, cv::IMREAD_COLOR);
             if (!frame.empty()) {
-#ifdef WITH_OVERLAY
-                overlay.render(frame);
-#endif
                 cv::imshow("fun_ofdm video", frame);
-#ifdef WITH_TUI
+#if defined(WITH_TUI) || defined(WITH_DIAG)
                 g_stats.note_video_frame_displayed(jpeg.size());
 #endif
             } else {
@@ -291,6 +306,11 @@ int main(int /*argc*/, char** /*argv*/)
 
     rx.pause();
     cv::destroyAllWindows();
+
+#ifdef WITH_DIAG
+    diag.stop();
+    diag_thread.join();
+#endif
 
 #ifdef WITH_TUI
     tui.stop();
