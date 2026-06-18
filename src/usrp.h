@@ -61,6 +61,7 @@ namespace fun
     {
     public:
 
+        uhd::usrp::multi_usrp::sptr get_multi_usrp() const { return m_usrp; };// get m_usrp porinter to reciever chain for rssi thread
         /*!
          * \brief Constructor for usrp class.
          * \param params the parameters for the intance of this class. These parameters will remain

@@ -36,6 +36,9 @@ namespace fun
     class   receiver
     {
     public:
+        uhd::usrp::multi_usrp::sptr get_multi_usrp() {
+            return m_usrp.get_multi_usrp();
+        }
 
         /*!
          * \brief Constructor for the receiver with raw parameters
