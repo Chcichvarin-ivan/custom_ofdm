@@ -47,8 +47,8 @@ namespace fun
                    }
             std::cerr << "Ref locked: " << (locked ? "yes" : "NO") << std::endl;
 
-            m_usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
-            m_usrp->set_tx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
+           //m_usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
+            //m_usrp->set_tx_subdev_spec(uhd::usrp::subdev_spec_t("A:A"));
 
             m_usrp->set_tx_rate(params.rate);
             m_usrp->set_rx_rate(params.rate);
@@ -63,16 +63,16 @@ namespace fun
             m_usrp->set_tx_gain(params.tx_gain);  // start around 70
             m_usrp->set_rx_gain(params.rx_gain);  // start around 40
 
-            m_usrp->set_tx_antenna("TX/RX");
+           // m_usrp->set_tx_antenna("TX/RX");
             m_usrp->set_rx_antenna("RX2");  // separate RX port; better isolation than TX/RX
 
-        //m_usrp->set_rx_agc(true);
+           // m_usrp->set_rx_agc(true);
             // Set analog filter bandwidth to match the OFDM signal width.
-            m_usrp->set_tx_bandwidth(params.rate * 2);//1.5);
-            m_usrp->set_rx_bandwidth(params.rate * 2);//1.5);
+            m_usrp->set_tx_bandwidth(params.rate * 1.5);
+            m_usrp->set_rx_bandwidth(params.rate * 1.5);
 
             m_usrp->set_rx_dc_offset(true);      // enable auto DC offset correction
-            m_usrp->set_rx_iq_balance(true,uhd::usrp::multi_usrp::ALL_CHANS);     // enable auto IQ balance correction
+           m_usrp->set_rx_iq_balance(true,uhd::usrp::multi_usrp::ALL_CHANS);     // enable auto IQ balance correction
 
 
             // Streamers — replaces N210's get_device()->get_max_recv_samps_per_packet() pattern.
