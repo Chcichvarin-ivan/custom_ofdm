@@ -122,7 +122,7 @@ static void flush_frame(uint32_t frame_id, PartialFrame& pf)
     g_last_displayed_frame_id = frame_id;
     g_have_displayed = true;
 }
-
+static int dbg = 0;
 // ---------------------------------------------------------------------------
 static void process_app_packet(const std::vector<unsigned char>& pkt)
 {
