@@ -155,31 +155,37 @@ private:
     }
 
     // The core logic: combine signal level and error rate into a diagnosis.
-    const char* classify(bool have_rssi, double rssi_db,
-                          double err_pct, uint64_t rx_per_s) {
-        // No packets arriving at all -> link is down, not just noisy.
-        if (rx_per_s == 0)
-            return "NO PACKETS (link down / not transmitting / wrong freq)";
-
-        const bool errors_high = err_pct > 5.0;
-
-        if (!errors_high)
-            return "HEALTHY";
-
+    LinkVerdict classify(bool have_rssi, double rssi_db,
+                         double err_pct, uint64_t rx_per_s) {
+        if (rx_per_s == 0) return LinkVerdict::NoSignal;
+        if (err_pct <= 5.0) return LinkVerdict::Healthy;
         // Errors are high. Use RSSI to decide which kind of trouble.
         if (have_rssi) {
-            // These thresholds are starting points -- adjust to your unit.
-            // On a B200 mini, ADC saturation tends to show up as RSSI above
-            // roughly -20 dBm at the frontend. Below ~-70 dBm you're weak.
-            if (rssi_db > SAT_THRESHOLD_DBM)
-                return "SATURATION  (lower RX gain / remove LNA / back off)";
-            if (rssi_db < WEAK_THRESHOLD_DBM)
-                return "WEAK SIGNAL (raise gain / closer / aim antenna)";
-            return "ERRORS at mid-level (check freq match, clock, multipath)";
+            if (rssi_db > SAT_THRESHOLD_DBM)  return LinkVerdict::Saturation;
+            if (rssi_db < WEAK_THRESHOLD_DBM) return LinkVerdict::Weak;
+            return LinkVerdict::MidErrors;
         }
-        // No RSSI: can't disambiguate automatically.
-        return "ERRORS (no RSSI to classify -- if signal is strong, suspect"
-               " saturation; if weak, suspect range)";
+        return LinkVerdict::MidErrors;  // can't disambiguate without RSSI
+    }
+
+    // Map the verdict to the detailed line printed to stderr.
+    static const char* verdict_text(LinkVerdict v, bool have_rssi) {
+        switch (v) {
+            case LinkVerdict::NoSignal:
+                return "NO PACKETS (link down / not transmitting / wrong freq)";
+            case LinkVerdict::Healthy:
+                return "HEALTHY";
+            case LinkVerdict::Saturation:
+                return "SATURATION  (lower RX gain / remove LNA / back off)";
+            case LinkVerdict::Weak:
+                return "WEAK SIGNAL (raise gain / closer / aim antenna)";
+            case LinkVerdict::MidErrors:
+                return have_rssi
+                    ? "ERRORS at mid-level (check freq match, clock, multipath)"
+                    : "ERRORS (no RSSI -- if signal strong suspect saturation,"
+                      " if weak suspect range)";
+            default: return "...";
+        }
     }
 
     // Tunable thresholds (dBm at the RX frontend). Adjust after observing
