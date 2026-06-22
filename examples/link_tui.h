@@ -18,8 +18,6 @@
 
 namespace stats {
 
-
-
 class LinkTui {
 public:
     LinkTui(LinkStats& s, TuiMode mode) : m_stats(s), m_mode(mode) {}
@@ -140,6 +138,32 @@ private:
           << EOL << "\n";
 
         int r = 4;
+        // ---- RF layer (RSSI + verdict from the diagnostic) ----
+        o << cup(r++,1) << BOLD << "RF layer" << RESET << EOL;
+        {
+            const char* vcolor = GRAY;
+            const char* vtext  = "--";
+            switch (s.verdict) {
+                case LinkVerdict::Healthy:    vcolor=GREEN;  vtext="HEALTHY";    break;
+                case LinkVerdict::Saturation: vcolor=RED;    vtext="SATURATION"; break;
+                case LinkVerdict::Weak:       vcolor=YELLOW; vtext="WEAK";       break;
+                case LinkVerdict::NoSignal:   vcolor=RED;    vtext="NO SIGNAL";  break;
+                case LinkVerdict::MidErrors:  vcolor=YELLOW; vtext="ERRORS";     break;
+                default:                      vcolor=GRAY;   vtext="(no data)";  break;
+            }
+            if (s.have_rssi) {
+                o << cup(r++,1) << "  RSSI      : "
+                  << std::fixed << std::setprecision(1) << s.rssi_dbm
+                  << " dBm" << EOL;
+            } else {
+                o << cup(r++,1) << GRAY << "  RSSI      : n/a (sensor "
+                     "unavailable)" << RESET << EOL;
+            }
+            o << cup(r++,1) << "  Status    : " << vcolor << vtext << RESET
+              << EOL;
+        }
+
+        r++;
         o << cup(r++,1) << BOLD << "PHY layer" << RESET << EOL;
         o << cup(r++,1) << "  PHY pkts  : " << s.phy_packets_rx
           << " (" << std::fixed << std::setprecision(0)
