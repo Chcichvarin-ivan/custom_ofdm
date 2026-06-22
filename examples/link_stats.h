@@ -10,7 +10,13 @@
 #include <mutex>
 
 namespace stats {
-    enum class TuiMode { TX, RX };
+
+enum class TuiMode { TX, RX };
+
+// RF-layer health verdict, produced by LinkDiagnostics, surfaced for the TUI
+// and overlay so they can show "SATURATION" / "WEAK" / "HEALTHY" on screen.
+enum class LinkVerdict { Unknown, Healthy, Saturation, Weak, NoSignal, MidErrors };
+
 class LinkStats {
 public:
     LinkStats() : m_start(std::chrono::steady_clock::now()) {}
