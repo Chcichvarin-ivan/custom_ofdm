@@ -61,6 +61,18 @@ public:
         m_video_frames_dropped.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // ---- RF-layer metrics, written by LinkDiagnostics ----
+    // RSSI in dBm; has_rssi flags whether the sensor is producing real values.
+    void update_rssi_dbm(double dbm, bool valid) {
+        // store as integer millibel to keep it atomic-friendly
+        m_rssi_mdbm.store(static_cast<int64_t>(dbm * 1000.0),
+                          std::memory_order_relaxed);
+        m_have_rssi.store(valid, std::memory_order_relaxed);
+    }
+    void update_verdict(LinkVerdict v) {
+        m_verdict.store(static_cast<int>(v), std::memory_order_relaxed);
+    }
+
     // ---- Snapshot for the TUI ----
     struct Snapshot {
         // Cumulative
@@ -89,6 +101,10 @@ public:
         double fec_repair_pct = 0.0;
         double rejection_pct = 0.0;
         double uptime_s = 0.0;
+        // RF-layer (from LinkDiagnostics)
+        bool        have_rssi = false;
+        double      rssi_dbm  = 0.0;
+        LinkVerdict verdict   = LinkVerdict::Unknown;
     };
 
     Snapshot sample() {
@@ -160,6 +176,10 @@ private:
     std::atomic<uint64_t> m_fec_repair_used{0};
     std::atomic<uint64_t> m_jpeg_bytes{0};
     std::atomic<uint64_t> m_jpeg_bytes_rx{0};
+    // RF-layer metrics written by LinkDiagnostics, read in sample().
+    std::atomic<int64_t> m_rssi_mdbm{0};      // RSSI * 1000, milli-dBm
+    std::atomic<bool>    m_have_rssi{false};
+    std::atomic<int>     m_verdict{0};        // LinkVerdict as int
 
     std::mutex m_mu;
     std::chrono::steady_clock::time_point m_start;
