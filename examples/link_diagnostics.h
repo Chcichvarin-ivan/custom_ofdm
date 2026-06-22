@@ -48,6 +48,12 @@ public:
 
     void stop() { m_running.store(false); }
 
+    // Control whether the per-second diagnostic line is printed to stderr.
+    // Turn this OFF when a TUI or overlay is showing RSSI/verdict instead, so
+    // the console isn't spammed (and doesn't scramble the TUI's display).
+    // Default ON, so standalone use (no TUI) still logs to the console.
+    void set_console_output(bool on) { m_console.store(on); }
+
     void run() {
         probe_sensors();   // one-time: list what's available
 
@@ -87,60 +93,74 @@ public:
             }
 
             // ---- verdict ----
-            const char* verdict = classify(have_rssi, rssi_db, err_pct, d_rx);
+            LinkVerdict v = classify(have_rssi, rssi_db, err_pct, d_rx);
 
-            // ---- print one line ----
-            std::ostringstream o;
-            o << "[DIAG] ";
-            if (have_rssi) {
-                o << "RSSI " << std::fixed << std::setprecision(1)
-                  << std::setw(7) << rssi_db << " dBm  ";
-            } else {
-                o << "RSSI   n/a      ";
+            // ---- surface to LinkStats so the TUI/overlay can show it ----
+            // (always — this is how the visual displays get RSSI/verdict)
+            m_stats.update_rssi_dbm(rssi_db, have_rssi);
+            m_stats.update_verdict(v);
+
+            // ---- optionally print one line to stderr ----
+            // Skipped when a TUI/overlay is showing the data (console off), so
+            // we don't spam the terminal or scramble the TUI's cursor output.
+            if (m_console.load()) {
+                std::ostringstream o;
+                o << "[DIAG] ";
+                if (have_rssi) {
+                    o << "RSSI " << std::fixed << std::setprecision(1)
+                      << std::setw(7) << rssi_db << " dBm  ";
+                } else {
+                    o << "RSSI   n/a      ";
+                }
+                o << "rx/s " << std::setw(4) << d_rx << "  "
+                  << "err " << std::fixed << std::setprecision(1)
+                  << std::setw(5) << err_pct << "%  "
+                  << "-> " << verdict_text(v, have_rssi);
+                if (have_rssi && rssi_stuck_count >= 5) {
+                    o << "  (warning: RSSI not changing -- sensor may be"
+                         " unreliable on this unit; trust err% + your gain)";
+                }
+                std::cerr << o.str() << std::endl;
             }
-            o << "rx/s " << std::setw(4) << d_rx << "  "
-              << "err " << std::fixed << std::setprecision(1)
-              << std::setw(5) << err_pct << "%  "
-              << "-> " << verdict;
-            if (have_rssi && rssi_stuck_count >= 5) {
-                o << "  (warning: RSSI not changing -- sensor may be"
-                     " unreliable on this unit; trust err% + your gain)";
-            }
-            std::cerr << o.str() << std::endl;
         }
     }
 
 private:
-    // Enumerate and print the RX sensors this unit actually exposes.
+    // Enumerate the RX sensors this unit exposes (and optionally print them).
     void probe_sensors() {
-        std::cerr << "[DIAG] Probing RX sensors on channel "
-                  << m_chan << "...\n";
+        const bool say = m_console.load();
+        if (say)
+            std::cerr << "[DIAG] Probing RX sensors on channel "
+                      << m_chan << "...\n";
         try {
             std::vector<std::string> names =
                 m_usrp->get_rx_sensor_names(m_chan);
-            std::ostringstream o;
-            o << "[DIAG] Available RX sensors:";
-            for (auto& n : names) o << " " << n;
-            std::cerr << o.str() << std::endl;
-
-            // Does rssi exist?
+            if (say) {
+                std::ostringstream o;
+                o << "[DIAG] Available RX sensors:";
+                for (auto& n : names) o << " " << n;
+                std::cerr << o.str() << std::endl;
+            }
+            // Detect rssi (this must happen regardless of console output).
             m_have_rssi_sensor = false;
             for (auto& n : names)
                 if (n == "rssi") m_have_rssi_sensor = true;
-            if (!m_have_rssi_sensor)
+            if (!m_have_rssi_sensor && say)
                 std::cerr << "[DIAG] No 'rssi' sensor on this unit/UHD. "
                              "Will report error-rate only.\n";
         } catch (const std::exception& e) {
-            std::cerr << "[DIAG] Could not enumerate sensors: "
-                      << e.what() << "\n";
+            if (say)
+                std::cerr << "[DIAG] Could not enumerate sensors: "
+                          << e.what() << "\n";
             m_have_rssi_sensor = false;
         }
 
-        // Also report the static gain we're running, for context.
-        try {
-            double g = m_usrp->get_rx_gain(m_chan);
-            std::cerr << "[DIAG] Current RX gain: " << g << " dB\n";
-        } catch (...) {}
+        if (say) {
+            try {
+                double g = m_usrp->get_rx_gain(m_chan);
+                std::cerr << "[DIAG] Current RX gain: " << g << " dB\n";
+            } catch (...) {}
+        }
     }
 
     bool read_rssi(double& out_db) {
@@ -198,6 +218,7 @@ private:
     size_t m_chan;
     bool m_have_rssi_sensor = false;
     std::atomic<bool> m_running{true};
+    std::atomic<bool> m_console{true};   // print per-second line to stderr?
 };
 
 }  // namespace stats
