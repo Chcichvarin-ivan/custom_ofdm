@@ -171,8 +171,16 @@ private:
               << "    0%=clean   ~20%=at limit   >25%=unrecoverable"
               << RESET << EOL;
         } else {
-            o << cup(r++,1) << DIM << "  (not compiled with WITH_FEC)"
-              << RESET << EOL;
+            // No generation has completed yet. If PHY packets are arriving,
+            // we're just waiting for the first to fill; otherwise nothing has
+            // been received at all. (Not a "no FEC" condition.)
+            if (s.phy_packets_rx > 0)
+                o << cup(r++,1) << DIM
+                  << "  (waiting for first generation to decode...)"
+                  << RESET << EOL;
+            else
+                o << cup(r++,1) << DIM << "  (no packets received yet)"
+                  << RESET << EOL;
         }
 
         r++;

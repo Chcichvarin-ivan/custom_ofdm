@@ -131,12 +131,41 @@ public:
 
         const double dt = std::chrono::duration<double>(now - m_last_t).count();
         if (m_have_last && dt > 0.001) {
-            s.video_fps_tx = (s.video_frames_encoded   - m_last_vft) / dt;
-            s.video_fps_rx = (s.video_frames_displayed - m_last_vfr) / dt;
-            s.phy_pps_tx   = (s.phy_packets_tx - m_last_phy_tx) / dt;
-            s.phy_pps_rx   = (s.phy_packets_rx - m_last_phy_rx) / dt;
-            s.app_kbps_tx  = ((s.jpeg_bytes    - m_last_jb)   * 8.0 / 1000.0) / dt;
-            s.app_kbps_rx  = ((s.jpeg_bytes_rx - m_last_jbrx) * 8.0 / 1000.0) / dt;
+            // Compute instantaneous rates over this interval.
+            double v_fps_tx = (s.video_frames_encoded   - m_last_vft) / dt;
+            double v_fps_rx = (s.video_frames_displayed - m_last_vfr) / dt;
+            double p_pps_tx = (s.phy_packets_tx - m_last_phy_tx) / dt;
+            double p_pps_rx = (s.phy_packets_rx - m_last_phy_rx) / dt;
+            double a_kbps_tx = ((s.jpeg_bytes    - m_last_jb)   * 8.0/1000.0)/dt;
+            double a_kbps_rx = ((s.jpeg_bytes_rx - m_last_jbrx) * 8.0/1000.0)/dt;
+
+            // If an interval sees NO new packets at all, the source is paused
+            // (e.g. the loopback test just finished its loop). Showing 0 in
+            // that case is misleading, so hold the previous non-zero rates
+            // rather than flickering to zero on a quiet tick.
+            const bool quiet_tick =
+                (s.phy_packets_rx == m_last_phy_rx) &&
+                (s.phy_packets_tx == m_last_phy_tx);
+            if (quiet_tick && m_have_rates) {
+                s.video_fps_tx = m_last_v_fps_tx;
+                s.video_fps_rx = m_last_v_fps_rx;
+                s.phy_pps_tx   = m_last_p_pps_tx;
+                s.phy_pps_rx   = m_last_p_pps_rx;
+                s.app_kbps_tx  = m_last_a_kbps_tx;
+                s.app_kbps_rx  = m_last_a_kbps_rx;
+            } else {
+                s.video_fps_tx = v_fps_tx;
+                s.video_fps_rx = v_fps_rx;
+                s.phy_pps_tx   = p_pps_tx;
+                s.phy_pps_rx   = p_pps_rx;
+                s.app_kbps_tx  = a_kbps_tx;
+                s.app_kbps_rx  = a_kbps_rx;
+                m_last_v_fps_tx = v_fps_tx; m_last_v_fps_rx = v_fps_rx;
+                m_last_p_pps_tx = p_pps_tx; m_last_p_pps_rx = p_pps_rx;
+                m_last_a_kbps_tx = a_kbps_tx; m_last_a_kbps_rx = a_kbps_rx;
+                m_have_rates = true;
+            }
+
             const uint64_t total = (s.fec_source_used + s.fec_repair_used)
                                  - (m_last_src + m_last_rep);
             const uint64_t reps  = s.fec_repair_used - m_last_rep;
@@ -157,6 +186,12 @@ public:
         m_last_rep     = s.fec_repair_used;
         m_last_t       = now;
         m_have_last    = true;
+
+        // RF-layer fields (written asynchronously by LinkDiagnostics)
+        s.have_rssi = m_have_rssi.load(std::memory_order_relaxed);
+        s.rssi_dbm  = m_rssi_mdbm.load(std::memory_order_relaxed) / 1000.0;
+        s.verdict   = static_cast<LinkVerdict>(
+                          m_verdict.load(std::memory_order_relaxed));
         return s;
     }
 
@@ -189,6 +224,12 @@ private:
     uint64_t m_last_phy_tx = 0, m_last_phy_rx = 0, m_last_phy_rej = 0;
     uint64_t m_last_jb = 0, m_last_jbrx = 0;
     uint64_t m_last_src = 0, m_last_rep = 0;
+    // Last computed rates, held across "quiet" sampling intervals so the
+    // display doesn't flicker to zero when the source briefly pauses.
+    bool m_have_rates = false;
+    double m_last_v_fps_tx = 0, m_last_v_fps_rx = 0;
+    double m_last_p_pps_tx = 0, m_last_p_pps_rx = 0;
+    double m_last_a_kbps_tx = 0, m_last_a_kbps_rx = 0;
 };
 
 }  // namespace stats
