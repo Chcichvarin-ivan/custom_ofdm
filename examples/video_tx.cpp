@@ -1,12 +1,22 @@
 /*!
  * \file video_tx.cpp
- * \brief Webcam video TX over fun_ofdm, with optional FEC and TUI.
+ * \brief H.265 video TX over fun_ofdm (Radxa RK3588, hardware VPU encode).
  *
- *   -DWITH_FEC enables RaptorQ FEC (generation 32 src + 8 repair).
- *   -DWITH_TUI enables the terminal-based link-health display.
+ *   -DWITH_FEC enables RaptorQ FEC (must match the RX build). STRONGLY
+ *              recommended for H.265 — see note below.
+ *   -DWITH_TUI enables the terminal link-health display.
  *
- * Build both together, individually, or neither. The non-FEC, non-TUI build
- * is identical in behavior to the original video_tx.
+ * Captures from the camera, encodes to H.265 on the RK3588 hardware encoder
+ * (mpph265enc) via a GStreamer pipeline that delivers compressed frames to an
+ * appsink, then packetizes each compressed frame over fun_ofdm. A keyframe
+ * flag is set in the packet header so the RX can resync after loss.
+ *
+ * WHY FEC MATTERS HERE: H.265 delta frames reference earlier frames, so a
+ * single lost packet corrupts video until the next keyframe. Testing showed
+ * that at ~1.5% packet loss WITHOUT FEC, ~80% of frames are lost. Build with
+ * -DWITH_FEC so the FEC recovers lost packets before they break the stream.
+ *
+ * 720p @ 4 Mbit/s, keyframe every 15 frames (~0.5 s).
  */
 
 #include <iostream>
@@ -19,10 +29,12 @@
 #include <csignal>
 #include <arpa/inet.h>
 
-#include <opencv2/opencv.hpp>
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 
 #include "transmitter.h"
 #include "realtime.h"
+#include "video_packet.h"
 
 #ifdef WITH_FEC
 #  include "fec_common.h"
@@ -41,58 +53,59 @@ static const double FREQ        = 3.4e9;
 static const double SAMPLE_RATE = 20e6;
 static const double TX_GAIN     = 70.0;
 static const double TX_AMP      = 0.6;
-static const Rate   PHY_RATE    =   RATE_1_2_QPSK;
+static const Rate   PHY_RATE    = RATE_1_2_QPSK;
 
-// ---------------------- Packet geometry -------------------------------------
-static const std::size_t PACKET_SIZE  = 1900;
-static const std::size_t HEADER_SIZE  = 20;
-static const std::size_t PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;
-static const uint32_t    MAGIC        = 0xDEADBEEFu;
-
-// ---------------------- Camera / encoding -----------------------------------
-static const int CAM_INDEX  = 0;
-static const int FRAME_W    = 640;
-static const int FRAME_H    = 480;
-static const int JPEG_Q     = 50;
-static const int TARGET_FPS = 30;
+// ---------------------- Video / encoder -------------------------------------
+// 720p @ 4 Mbit/s leaves headroom under a ~5 Mbit/s link. Keyframe every 15
+// frames so loss recovers within ~0.5 s. Adjust bps / gop here.
+//   gop on mpph265enc: property name may be "gop" on your build. Verify with
+//   `gst-inspect-1.0 mpph265enc | grep -iE "gop|key"`. If it's a different
+//   name, change KEY_PROP below.
+static const char* CAM_DEVICE = "/dev/video11";
+static const int   FRAME_W    = 1280;
+static const int   FRAME_H    = 720;
+static const int   TARGET_FPS = 30;
+static const int   BPS        = 4000000;   // 4 Mbit/s
+static const int   GOP        = 15;        // keyframe interval (frames)
 
 #ifdef WITH_FEC
-static_assert(fec::SYMBOL_SIZE >= PACKET_SIZE,
+static_assert(fec::SYMBOL_SIZE >= vid::PACKET_SIZE,
               "fec::SYMBOL_SIZE must be >= PACKET_SIZE (set to 1920)");
 static fec::FecEncoder g_enc;
 #endif
-
 #ifdef WITH_TUI
 static stats::LinkStats g_stats;
+static stats::LinkTui*  g_tui_ptr = nullptr;
+#endif
 static std::atomic<bool> g_stop{false};
-static stats::LinkTui*   g_tui_ptr = nullptr;
+
 static void on_signal(int) {
     g_stop.store(true);
+#ifdef WITH_TUI
     if (g_tui_ptr) g_tui_ptr->stop();
-}
 #endif
+}
 
 // ----------------------------------------------------------------------------
 static void build_packet(std::vector<unsigned char>& pkt,
-                         uint32_t frame_id,
-                         uint16_t chunk_index,
-                         uint16_t total_chunks,
-                         const unsigned char* payload,
-                         uint16_t payload_size)
+                         uint32_t frame_id, uint16_t chunk_index,
+                         uint16_t total_chunks, uint8_t flags,
+                         const unsigned char* payload, uint16_t payload_size)
 {
-    pkt.assign(PACKET_SIZE, 0);
-    uint32_t magic_n      = htonl(MAGIC);
-    uint32_t frame_id_n   = htonl(frame_id);
-    uint16_t chunk_idx_n  = htons(chunk_index);
-    uint16_t total_n      = htons(total_chunks);
-    uint16_t payload_sz_n = htons(payload_size);
-    std::memcpy(&pkt[0],  &magic_n,      4);
-    std::memcpy(&pkt[4],  &frame_id_n,   4);
-    std::memcpy(&pkt[8],  &chunk_idx_n,  2);
-    std::memcpy(&pkt[10], &total_n,      2);
-    std::memcpy(&pkt[12], &payload_sz_n, 2);
+    pkt.assign(vid::PACKET_SIZE, 0);
+    uint32_t magic_n   = htonl(vid::MAGIC);
+    uint32_t fid_n     = htonl(frame_id);
+    uint16_t chunk_n   = htons(chunk_index);
+    uint16_t total_n   = htons(total_chunks);
+    uint16_t paysz_n   = htons(payload_size);
+    std::memcpy(&pkt[vid::OFF_MAGIC],      &magic_n, 4);
+    std::memcpy(&pkt[vid::OFF_FRAME_ID],   &fid_n,   4);
+    std::memcpy(&pkt[vid::OFF_CHUNK_IDX],  &chunk_n, 2);
+    std::memcpy(&pkt[vid::OFF_TOTAL],      &total_n, 2);
+    std::memcpy(&pkt[vid::OFF_PAYLOAD_SZ], &paysz_n, 2);
+    pkt[vid::OFF_FLAGS] = flags;
     if (payload_size > 0)
-        std::memcpy(&pkt[HEADER_SIZE], payload, payload_size);
+        std::memcpy(&pkt[vid::HEADER_SIZE], payload, payload_size);
 }
 
 static void transmit_packet(transmitter& tx,
@@ -115,16 +128,48 @@ static void transmit_packet(transmitter& tx,
 #endif
 }
 
+// Packetize one compressed H.265 frame and send it.
+static void send_h265_frame(transmitter& tx, const unsigned char* data,
+                            std::size_t nbytes, bool keyframe,
+                            uint32_t frame_id)
+{
+    std::size_t total_chunks =
+        (nbytes + vid::PAYLOAD_SIZE - 1) / vid::PAYLOAD_SIZE;
+    if (total_chunks == 0) total_chunks = 1;
+    if (total_chunks > 0xFFFFu) return;  // frame too large to index
+
+    uint8_t flags = keyframe ? vid::FLAG_KEYFRAME : 0;
+
+#ifdef WITH_TUI
+    g_stats.note_video_frame_encoded(nbytes, total_chunks);
+#endif
+
+    std::vector<unsigned char> packet;
+    for (std::size_t i = 0; i < total_chunks; ++i) {
+        std::size_t offset    = i * vid::PAYLOAD_SIZE;
+        std::size_t remaining = nbytes - offset;
+        uint16_t this_payload =
+            static_cast<uint16_t>(std::min(remaining, vid::PAYLOAD_SIZE));
+        build_packet(packet, frame_id, static_cast<uint16_t>(i),
+                     static_cast<uint16_t>(total_chunks), flags,
+                     data + offset, this_payload);
+        transmit_packet(tx, packet);
+    }
+}
+
 int main(int /*argc*/, char** /*argv*/)
 {
-    std::cout << "fun_ofdm video TX"
+    gst_init(nullptr, nullptr);
+
+    std::cout << "fun_ofdm H.265 video TX"
 #ifdef WITH_FEC
               << " [FEC]"
 #endif
 #ifdef WITH_TUI
               << " [TUI]"
 #endif
-              << "\n";
+              << "  " << FRAME_W << "x" << FRAME_H << " @ " << (BPS/1000000.0)
+              << " Mbit/s, keyframe every " << GOP << "\n";
 
     set_realtime_priority(1.0f);
 
@@ -139,94 +184,90 @@ int main(int /*argc*/, char** /*argv*/)
     std::thread tui_thread([&tui]() { tui.run(); });
 #endif
 
-    cv::VideoCapture cap(CAM_INDEX);
-    if (!cap.isOpened()) {
-        std::cerr << "ERROR: cannot open webcam index " << CAM_INDEX << "\n";
+    // ---- Build the hardware-encode pipeline ending in appsink ----
+    // mpph265enc = RK3588 hardware HEVC encoder.
+    //   bps      : target bitrate
+    //   rc-mode  : vbr (variable, quality-priority within the budget)
+    //   gop      : keyframe interval (SEE NOTE: verify property name on your
+    //              build via `gst-inspect-1.0 mpph265enc`)
+    // h265parse with config-interval=1 re-sends SPS/PPS with every keyframe so
+    // the decoder can start/resync mid-stream — important for a lossy link.
+    char desc[1024];
+    std::snprintf(desc, sizeof(desc),
+        "v4l2src device=%s ! "
+        "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1 ! "
+        "mpph265enc bps=%d rc-mode=vbr gop=%d ! "
+        "h265parse config-interval=1 ! "
+        "video/x-h265,stream-format=byte-stream,alignment=au ! "
+        "appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true",
+        CAM_DEVICE, FRAME_W, FRAME_H, TARGET_FPS, BPS, GOP);
+
+    GError* err = nullptr;
+    GstElement* pipeline = gst_parse_launch(desc, &err);
+    if (!pipeline) {
+        std::cerr << "Encode pipeline failed: "
+                  << (err ? err->message : "?") << "\n";
+        std::cerr << "If it's the 'gop' property, run "
+                     "`gst-inspect-1.0 mpph265enc` and use the right name.\n";
+        if (err) g_error_free(err);
         return 1;
     }
-    cap.set(cv::CAP_PROP_FRAME_WIDTH,  FRAME_W);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, FRAME_H);
-    cap.set(cv::CAP_PROP_FPS,          TARGET_FPS);
+    GstAppSink* sink =
+        GST_APP_SINK(gst_bin_get_by_name(GST_BIN(pipeline), "sink"));
+    if (!sink) { std::cerr << "no appsink\n"; return 1; }
 
     transmitter tx(FREQ, SAMPLE_RATE, TX_GAIN, TX_AMP,
                    "type=b200,serial=3123B0D");
 
-    std::vector<int> jpeg_params = { cv::IMWRITE_JPEG_QUALITY, JPEG_Q };
-    std::vector<unsigned char> packet;
-    std::vector<unsigned char> jpeg_buf;
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) ==
+        GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "Failed to start encode pipeline (camera/format/encoder)\n";
+        return 1;
+    }
 
     uint32_t frame_id = 0;
-    const auto frame_period = std::chrono::milliseconds(1000 / TARGET_FPS);
 
-#ifdef WITH_TUI
     while (!g_stop.load()) {
-#else
-    while (true) {
-#endif
-        auto t0 = std::chrono::steady_clock::now();
-
-        cv::Mat frame;
-        if (!cap.read(frame) || frame.empty()) {
-            std::cerr << "WARN: empty frame\n";
+        // Pull one compressed H.265 frame from the hardware encoder.
+        GstSample* sample =
+            gst_app_sink_try_pull_sample(sink, 100 * GST_MSECOND);
+        if (!sample) {
+            if (gst_app_sink_is_eos(sink)) break;
             continue;
         }
-        jpeg_buf.clear();
-        if (!cv::imencode(".jpg", frame, jpeg_buf, jpeg_params)) {
-            std::cerr << "WARN: JPEG encode failed\n";
-            continue;
+        GstBuffer* buf = gst_sample_get_buffer(sample);
+        bool keyframe =
+            !GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
+
+        GstMapInfo map;
+        if (gst_buffer_map(buf, &map, GST_MAP_READ)) {
+            send_h265_frame(tx, map.data, map.size, keyframe, frame_id);
+            gst_buffer_unmap(buf, &map);
+            ++frame_id;
         }
-
-        std::size_t nbytes = jpeg_buf.size();
-        std::size_t total_chunks =
-            (nbytes + PAYLOAD_SIZE - 1) / PAYLOAD_SIZE;
-        if (total_chunks == 0) total_chunks = 1;
-        if (total_chunks > 0xFFFFu) continue;
-
-#ifdef WITH_TUI
-        g_stats.note_video_frame_encoded(nbytes, total_chunks);
-#else
-        std::cout << "Frame " << frame_id << "  " << nbytes
-                  << " B  " << total_chunks << " pkts\n";
-#endif
-
-        for (std::size_t i = 0; i < total_chunks; ++i) {
-            std::size_t offset    = i * PAYLOAD_SIZE;
-            std::size_t remaining = nbytes - offset;
-            uint16_t this_payload =
-                static_cast<uint16_t>(std::min(remaining, PAYLOAD_SIZE));
-            build_packet(packet, frame_id,
-                         static_cast<uint16_t>(i),
-                         static_cast<uint16_t>(total_chunks),
-                         jpeg_buf.data() + offset, this_payload);
-            transmit_packet(tx, packet);
-        }
-        ++frame_id;
+        gst_sample_unref(sample);
 
 #ifdef WITH_FEC
-        // Do NOT flush every frame — that pads every generation and triples
-        // airtime. Only flush if too much time passed since last send, so a
-        // stalled stream still drains. Otherwise let generations fill across
-        // frames at their natural 32-packet boundary.
+        // Periodic flush so a stalled stream still drains (don't flush every
+        // frame — that pads generations and wastes airtime).
         static auto last_flush = std::chrono::steady_clock::now();
         auto now_f = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 now_f - last_flush).count() > 200) {
             g_enc.flush();
             last_flush = now_f;
-                }
-        while (g_enc.has_phy_packet()) {
-            tx.send_frame(g_enc.next_phy_packet(), PHY_RATE);
+            while (g_enc.has_phy_packet()) {
+                tx.send_frame(g_enc.next_phy_packet(), PHY_RATE);
 #  ifdef WITH_TUI
-            g_stats.note_phy_packet_tx();
+                g_stats.note_phy_packet_tx();
 #  endif
+            }
         }
 #endif
-
-        auto elapsed = std::chrono::steady_clock::now() - t0;
-        if (elapsed < frame_period)
-            std::this_thread::sleep_for(frame_period - elapsed);
     }
 
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
 #ifdef WITH_TUI
     tui.stop();
     tui_thread.join();
