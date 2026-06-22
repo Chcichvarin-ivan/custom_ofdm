@@ -114,8 +114,7 @@ static void transmit_packet(transmitter& tx,
 #ifdef WITH_FEC
     g_enc.add_rtp_packet(packet);
     while (g_enc.has_phy_packet()) {
-        std::vector<unsigned char> phy = g_enc.next_phy_packet();
-        tx.send_frame(phy, PHY_RATE);
+        tx.send_frame(g_enc.next_phy_packet(), PHY_RATE);
 #  ifdef WITH_TUI
         g_stats.note_phy_packet_tx();
 #  endif
