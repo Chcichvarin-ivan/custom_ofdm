@@ -1,360 +1,383 @@
 /*!
  * \file video_rx.cpp
- * \brief Webcam video RX over fun_ofdm, with optional FEC and TUI.
+ * \brief H.265 video RX over fun_ofdm (x86, software HEVC decode).
  *
- *   -DWITH_FEC enables RaptorQ FEC decoding (must match TX).
- *   -DWITH_TUI enables the terminal-based link-health display.
+ *   -DWITH_FEC enables RaptorQ FEC (must match the TX build).
+ *   -DWITH_TUI enables the terminal link-health display.
  *
- * The TUI runs in its own thread; OpenCV display remains in the main thread.
- * Stats are updated from the fun_ofdm receiver callback thread.
+ * Receives packetized H.265 over fun_ofdm, reassembles each compressed frame,
+ * and decodes it to video with GStreamer's software HEVC decoder
+ * (appsrc ! h265parse ! avdec_h265 ! ... ! appsink), displaying with OpenCV.
+ *
+ * LOSS HANDLING (important for a lossy radio link):
+ *   H.265 delta frames reference earlier frames. If a frame arrives incomplete
+ *   (a packet was lost), feeding it — or any following delta frame — to the
+ *   decoder produces garbage or errors. So after ANY incomplete frame, the RX
+ *   enters a "need keyframe" state and DROPS frames until the next keyframe,
+ *   which is a clean restart point. Keyframes arrive every ~15 frames (0.5 s)
+ *   from the TX, so recovery is quick.
  */
 
 #include <iostream>
 #include <vector>
 #include <map>
+#include <cstring>
+#include <cstdint>
+#include <atomic>
+#include <csignal>
+#include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
-#include <cstring>
-#include <cstdint>
-#include <chrono>
-#include <atomic>
-#include <csignal>
-#include <functional>
-#include <thread>
 #include <arpa/inet.h>
 
 #include <opencv2/opencv.hpp>
+#include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 
 #include "receiver.h"
 #include "realtime.h"
+#include "video_packet.h"
 
 #ifdef WITH_FEC
 #  include "fec_common.h"
 #  include "fec_decoder.h"
 #endif
 
-// WITH_STATS is true when ANY consumer of LinkStats is enabled (TUI, the
-// RSSI diagnostic, or the on-video overlay). The g_stats counters and object
-// are guarded by it; link_stats.h is included once here.
-#if defined(WITH_TUI) || defined(WITH_DIAG) || defined(WITH_OVERLAY)
-#  define WITH_STATS
-#  include "link_stats.h"
-#endif
-
 #ifdef WITH_TUI
+#  include "link_stats.h"
 #  include "link_tui.h"
-#endif
-#ifdef WITH_DIAG
-#  include "link_diagnostics.h"
-#endif
-#ifdef WITH_OVERLAY
-#  include "link_overlay.h"
 #endif
 
 using namespace fun;
 
-// ---------------------- Radio parameters (must match TX) --------------------
-static const double FREQ        = 3.3e9;
+// ---------------------- Radio parameters (match TX) -------------------------
+static const double FREQ        = 3.4e9;
 static const double SAMPLE_RATE = 20e6;
-static const double RX_GAIN     = 15.0;
-
-// ---------------------- Packet geometry (must match TX) --------------------
-static const std::size_t PACKET_SIZE  = 1900;
-static const std::size_t HEADER_SIZE  = 20;
-static const std::size_t PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;
-static const uint32_t    MAGIC        = 0xDEADBEEFu;
+static const double RX_GAIN     = 10.0;
 
 #ifdef WITH_FEC
-static_assert(fec::SYMBOL_SIZE >= PACKET_SIZE,
-              "fec::SYMBOL_SIZE must be >= PACKET_SIZE (set to 1920)");
 static fec::FecDecoder g_dec;
 #endif
-
-#ifdef WITH_STATS
-static stats::LinkStats g_stats;
-#endif
 #ifdef WITH_TUI
+static stats::LinkStats g_stats;
 static stats::LinkTui*  g_tui_ptr = nullptr;
 #endif
-#ifdef WITH_DIAG
-static stats::LinkDiagnostics* g_diag_ptr = nullptr;
-#endif
-
-// ---------------------------------------------------------------------------
-struct PartialFrame {
-    uint16_t total_chunks = 0;
-    std::vector<std::vector<unsigned char>> chunks;
-    std::vector<bool> received;
-    std::size_t chunks_received = 0;
-    std::chrono::steady_clock::time_point first_seen;
-};
-
-static std::mutex                                g_queue_mu;
-static std::condition_variable                   g_queue_cv;
-static std::queue<std::vector<unsigned char>>    g_jpeg_queue;
-static std::atomic<bool>                         g_stop{false};
-
-static std::map<uint32_t, PartialFrame> g_partials;
-static uint32_t g_last_displayed_frame_id = 0;
-static bool     g_have_displayed = false;
+static std::atomic<bool> g_stop{false};
 
 static void on_signal(int) {
     g_stop.store(true);
 #ifdef WITH_TUI
     if (g_tui_ptr) g_tui_ptr->stop();
 #endif
-#ifdef WITH_DIAG
-    if (g_diag_ptr) g_diag_ptr->stop();
-#endif
 }
 
-// RAII guard: stops and joins a std::thread in its destructor if still
-// joinable, so a thread can never be destroyed while running (which would
-// call std::terminate / abort) and join never hangs (because we stop first).
-// Used for the TUI and diagnostic threads so any exit path — normal,
-// exception, or signal — cleans them up safely.
-struct ThreadJoiner {
-    std::thread& t;
-    std::function<void()> stopper;
-    ThreadJoiner(std::thread& th, std::function<void()> stop)
-        : t(th), stopper(std::move(stop)) {}
-    ~ThreadJoiner() {
-        if (stopper) stopper();
-        if (t.joinable()) t.join();
+// ===========================================================================
+//  H.265 decode pipeline (GStreamer, software decode)
+//  We push reassembled compressed frames into appsrc; decoded raw frames come
+//  out of appsink, which we convert to cv::Mat and display.
+// ===========================================================================
+struct H265Decoder {
+    GstElement* pipeline = nullptr;
+    GstElement* src      = nullptr;   // appsrc: we push H.265 bytes in
+    GstAppSink* sink     = nullptr;   // appsink: decoded frames come out
+    std::atomic<bool> ok{false};
+
+    bool start() {
+        // BGR out so OpenCV can use it directly. avdec_h265 = libav software
+        // HEVC decoder. videoconvert handles the decoder's native format
+        // (typically I420) -> BGR.
+        const char* desc =
+            "appsrc name=src is-live=true do-timestamp=true format=time "
+            "  caps=video/x-h265,stream-format=byte-stream,alignment=au ! "
+            "h265parse ! avdec_h265 ! videoconvert ! "
+            "video/x-raw,format=BGR ! "
+            "appsink name=sink emit-signals=false sync=false max-buffers=2 drop=true";
+
+        GError* err = nullptr;
+        pipeline = gst_parse_launch(desc, &err);
+        if (!pipeline) {
+            std::cerr << "RX decode pipeline failed: "
+                      << (err ? err->message : "?") << "\n";
+            if (err) g_error_free(err);
+            return false;
+        }
+        src  = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+        sink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(pipeline), "sink"));
+        if (!src || !sink) {
+            std::cerr << "RX: could not get appsrc/appsink\n";
+            return false;
+        }
+        if (gst_element_set_state(pipeline, GST_STATE_PLAYING) ==
+            GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "RX: failed to start decode pipeline\n";
+            return false;
+        }
+        ok.store(true);
+        return true;
+    }
+
+    // Push one reassembled compressed H.265 frame into the decoder.
+    void push(const std::vector<unsigned char>& frame) {
+        if (!ok.load() || frame.empty()) return;
+        GstBuffer* buf = gst_buffer_new_allocate(nullptr, frame.size(), nullptr);
+        gst_buffer_fill(buf, 0, frame.data(), frame.size());
+        GstFlowReturn r =
+            gst_app_src_push_buffer(GST_APP_SRC(src), buf); // takes ownership
+        if (r != GST_FLOW_OK) {
+            // Non-fatal; decoder may be catching up.
+        }
+    }
+
+    // Pull a decoded frame if one is ready (non-blocking). Returns empty Mat
+    // if nothing available.
+    cv::Mat try_pull() {
+        if (!ok.load()) return cv::Mat();
+        GstSample* sample =
+            gst_app_sink_try_pull_sample(sink, 0); // 0 = non-blocking
+        if (!sample) return cv::Mat();
+
+        cv::Mat out;
+        GstCaps* caps = gst_sample_get_caps(sample);
+        GstBuffer* buf = gst_sample_get_buffer(sample);
+        GstStructure* s = caps ? gst_caps_get_structure(caps, 0) : nullptr;
+        int w = 0, h = 0;
+        if (s) { gst_structure_get_int(s, "width", &w);
+                 gst_structure_get_int(s, "height", &h); }
+        GstMapInfo map;
+        if (w > 0 && h > 0 && gst_buffer_map(buf, &map, GST_MAP_READ)) {
+            // BGR, 3 bytes/pixel. Copy out (the buffer is freed on unref).
+            cv::Mat tmp(h, w, CV_8UC3, (void*)map.data);
+            out = tmp.clone();
+            gst_buffer_unmap(buf, &map);
+        }
+        gst_sample_unref(sample);
+        return out;
+    }
+
+    void stop() {
+        if (src) gst_app_src_end_of_stream(GST_APP_SRC(src));
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_object_unref(pipeline);
+            pipeline = nullptr;
+        }
+        ok.store(false);
     }
 };
 
-// ---------------------------------------------------------------------------
-static void flush_frame(uint32_t frame_id, PartialFrame& pf)
-{
-    std::vector<unsigned char> jpeg;
-    jpeg.reserve(pf.total_chunks * PAYLOAD_SIZE);
-    for (uint16_t i = 0; i < pf.total_chunks; ++i)
-        jpeg.insert(jpeg.end(), pf.chunks[i].begin(), pf.chunks[i].end());
+static H265Decoder g_decoder;
 
-    {
-        std::lock_guard<std::mutex> lk(g_queue_mu);
-        while (g_jpeg_queue.size() > 4) g_jpeg_queue.pop();
-        g_jpeg_queue.push(std::move(jpeg));
+// ===========================================================================
+//  Frame reassembly (same idea as the JPEG RX, plus keyframe tracking and
+//  loss-aware resync).
+// ===========================================================================
+struct PartialFrame {
+    uint16_t total_chunks = 0;
+    uint16_t got = 0;
+    bool     is_keyframe = false;
+    std::vector<std::vector<unsigned char>> chunks; // indexed by chunk_index
+    std::vector<bool> have;
+};
+
+static std::map<uint32_t, PartialFrame> g_partials;
+
+// Resync state: after an incomplete frame, drop everything until next keyframe.
+static bool     g_need_keyframe = true;   // start by waiting for a keyframe
+static uint32_t g_last_pushed_frame = 0;
+static bool     g_have_pushed = false;
+
+// Reassemble a completed frame and push it to the decoder (with loss logic).
+static void deliver_frame(uint32_t frame_id, PartialFrame& pf)
+{
+    // Concatenate chunks in order into one compressed H.265 access unit.
+    std::vector<unsigned char> frame;
+    frame.reserve(pf.total_chunks * vid::PAYLOAD_SIZE);
+    for (uint16_t i = 0; i < pf.total_chunks; ++i)
+        frame.insert(frame.end(), pf.chunks[i].begin(), pf.chunks[i].end());
+
+    // ---- loss-aware gating ----
+    if (g_need_keyframe) {
+        if (!pf.is_keyframe) {
+            // Still waiting for a clean restart point; drop this delta frame.
+#ifdef WITH_TUI
+            g_stats.note_video_frame_dropped();
+#endif
+            return;
+        }
+        // A keyframe — we can resync here.
+        g_need_keyframe = false;
     }
-    g_queue_cv.notify_one();
-    g_last_displayed_frame_id = frame_id;
-    g_have_displayed = true;
+
+    g_decoder.push(frame);
+    g_last_pushed_frame = frame_id;
+    g_have_pushed = true;
+#ifdef WITH_TUI
+    g_stats.note_video_frame_displayed(frame.size());
+#endif
 }
 
-// ---------------------------------------------------------------------------
+// Called when a frame is detected as incomplete (we moved past it without all
+// its packets). Triggers resync.
+static void note_incomplete_frame()
+{
+    g_need_keyframe = true;
+#ifdef WITH_TUI
+    g_stats.note_video_frame_dropped();
+#endif
+}
+
 static void process_app_packet(const std::vector<unsigned char>& pkt)
 {
-    if (pkt.size() != PACKET_SIZE) {
-#ifdef WITH_STATS
+    if (pkt.size() != vid::PACKET_SIZE) {
+#ifdef WITH_TUI
         g_stats.note_phy_packet_rejected();
 #endif
         return;
     }
-    uint32_t magic_n, frame_id_n;
-    uint16_t chunk_idx_n, total_n, payload_sz_n;
-    std::memcpy(&magic_n,      &pkt[0],  4);
-    std::memcpy(&frame_id_n,   &pkt[4],  4);
-    std::memcpy(&chunk_idx_n,  &pkt[8],  2);
-    std::memcpy(&total_n,      &pkt[10], 2);
-    std::memcpy(&payload_sz_n, &pkt[12], 2);
-
-    if (ntohl(magic_n) != MAGIC) {
-#ifdef WITH_STATS
+    uint32_t magic_n;
+    std::memcpy(&magic_n, &pkt[vid::OFF_MAGIC], 4);
+    if (ntohl(magic_n) != vid::MAGIC) {
+#ifdef WITH_TUI
         g_stats.note_phy_packet_rejected();
 #endif
         return;
     }
 
-#ifdef WITH_STATS
-    g_stats.note_app_packet_rx();
-#endif
+    uint32_t frame_id_n; uint16_t chunk_n, total_n, paysz_n;
+    std::memcpy(&frame_id_n, &pkt[vid::OFF_FRAME_ID],   4);
+    std::memcpy(&chunk_n,    &pkt[vid::OFF_CHUNK_IDX],  2);
+    std::memcpy(&total_n,    &pkt[vid::OFF_TOTAL],      2);
+    std::memcpy(&paysz_n,    &pkt[vid::OFF_PAYLOAD_SZ], 2);
+    uint8_t flags = pkt[vid::OFF_FLAGS];
 
-    uint32_t frame_id     = ntohl(frame_id_n);
-    uint16_t chunk_index  = ntohs(chunk_idx_n);
-    uint16_t total_chunks = ntohs(total_n);
-    uint16_t payload_size = ntohs(payload_sz_n);
+    uint32_t frame_id    = ntohl(frame_id_n);
+    uint16_t chunk_index = ntohs(chunk_n);
+    uint16_t total_chunks= ntohs(total_n);
+    uint16_t payload_sz  = ntohs(paysz_n);
+    bool     keyframe    = (flags & vid::FLAG_KEYFRAME) != 0;
 
     if (total_chunks == 0 || chunk_index >= total_chunks) return;
-    if (payload_size > PAYLOAD_SIZE) return;
-    if (g_have_displayed && frame_id <= g_last_displayed_frame_id) return;
+    if (payload_sz > vid::PAYLOAD_SIZE) return;
+
+#ifdef WITH_TUI
+    g_stats.note_app_packet_rx();
+#endif
 
     PartialFrame& pf = g_partials[frame_id];
     if (pf.total_chunks == 0) {
         pf.total_chunks = total_chunks;
-        pf.chunks.resize(total_chunks);
-        pf.received.assign(total_chunks, false);
-        pf.first_seen = std::chrono::steady_clock::now();
+        pf.is_keyframe  = keyframe;
+        pf.chunks.assign(total_chunks, std::vector<unsigned char>());
+        pf.have.assign(total_chunks, false);
     }
-    if (pf.total_chunks != total_chunks) {
-        pf.total_chunks = total_chunks;
-        pf.chunks.assign(total_chunks, {});
-        pf.received.assign(total_chunks, false);
-        pf.chunks_received = 0;
-        pf.first_seen = std::chrono::steady_clock::now();
+    if (!pf.have[chunk_index]) {
+        pf.chunks[chunk_index].assign(pkt.begin() + vid::HEADER_SIZE,
+                                      pkt.begin() + vid::HEADER_SIZE + payload_sz);
+        pf.have[chunk_index] = true;
+        pf.got++;
     }
-    if (!pf.received[chunk_index]) {
-        pf.chunks[chunk_index].assign(
-            pkt.begin() + HEADER_SIZE,
-            pkt.begin() + HEADER_SIZE + payload_size);
-        pf.received[chunk_index] = true;
-        ++pf.chunks_received;
-    }
-    if (pf.chunks_received == pf.total_chunks) {
-        flush_frame(frame_id, pf);
+
+    // Complete?
+    if (pf.got == pf.total_chunks) {
+        deliver_frame(frame_id, pf);
         g_partials.erase(frame_id);
+    }
+
+    // Garbage-collect older partials: if we've completed/seen a newer frame,
+    // any still-incomplete older frame lost packets — mark resync + drop it.
+    for (auto it = g_partials.begin(); it != g_partials.end(); ) {
+        // "older" by a margin (frame_id wraps are far away in practice)
+        if ((int64_t)frame_id - (int64_t)it->first > 4) {
+            note_incomplete_frame();      // an older frame never completed
+            it = g_partials.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
+// fun_ofdm receive callback.
 static void rx_callback(std::vector<std::vector<unsigned char>> packets)
 {
     for (auto& pkt : packets) {
-#ifdef WITH_STATS
+#ifdef WITH_TUI
         g_stats.note_phy_packet_rx();
 #endif
 #ifdef WITH_FEC
-        std::vector<std::vector<unsigned char>> recovered =
-            g_dec.process_phy_packet(pkt);
-        for (auto& app : recovered) process_app_packet(app);
+        std::vector<std::vector<unsigned char>> apps = g_dec.process_phy_packet(pkt);
+        for (auto& app : apps) process_app_packet(app);
 #else
         process_app_packet(pkt);
 #endif
     }
-
-    // Garbage-collect stale partials
-    auto now = std::chrono::steady_clock::now();
-    for (auto it = g_partials.begin(); it != g_partials.end(); ) {
-        bool too_old = (now - it->second.first_seen) > std::chrono::seconds(1);
-        bool superseded = g_have_displayed &&
-                          (it->first + 30 < g_last_displayed_frame_id);
-        if (too_old || superseded) {
-#ifdef WITH_STATS
-            g_stats.note_video_frame_dropped();
-#endif
-            it = g_partials.erase(it);
-        } else ++it;
-    }
 }
 
-// ---------------------------------------------------------------------------
 int main(int /*argc*/, char** /*argv*/)
 {
-    std::cout << "fun_ofdm video RX"
+    gst_init(nullptr, nullptr);
+
+    std::cout << "fun_ofdm H.265 video RX"
 #ifdef WITH_FEC
               << " [FEC]"
 #endif
 #ifdef WITH_TUI
               << " [TUI]"
 #endif
-#ifdef WITH_DIAG
-              << " [DIAG]"
-#endif
-#ifdef WITH_OVERLAY
-              << " [OVERLAY]"
-#endif
               << "\n";
 
     std::signal(SIGINT,  on_signal);
     std::signal(SIGTERM, on_signal);
-
     set_realtime_priority(1.0f);
 
-    // Feed FEC decode/drop counts into the stats (used by TUI error-rate and
-    // the diagnostic). Safe to call regardless of which consumers are built.
-#if defined(WITH_FEC) && defined(WITH_STATS)
+    if (!g_decoder.start()) {
+        std::cerr << "Could not start H.265 decoder. Is gstreamer-libav "
+                     "(avdec_h265) installed?\n";
+        return 1;
+    }
+
+#ifdef WITH_FEC
+#  ifdef WITH_TUI
     g_dec.set_stats(&g_stats);
+#  endif
 #endif
 
-    // Construct the receiver (and thus the USRP) FIRST, before starting any
-    // worker threads. If device setup throws, we exit here with no threads
-    // alive — avoiding the abort that occurs when a joinable std::thread is
-    // destroyed during stack unwinding.
+#ifdef WITH_TUI
+    stats::LinkTui tui(g_stats, stats::TuiMode::RX);
+    g_tui_ptr = &tui;
+    std::thread tui_thread([&tui]() { tui.run(); });
+#endif
+
     receiver rx(&rx_callback, FREQ, SAMPLE_RATE, RX_GAIN,
                 "type=b200,serial=314C000,num_recv_frames=700,"
                 "num_send_frames=700,recv_frame_size=11000,"
                 "send_frame_size=11000");
 
-    // Now the device is up, start the worker threads. Each is wrapped in a
-    // ThreadJoiner so it is always joined on any exit path.
-#ifdef WITH_TUI
-    stats::LinkTui tui(g_stats, stats::TuiMode::RX);
-    g_tui_ptr = &tui;
-    std::thread tui_thread([&tui]() { tui.run(); });
-    ThreadJoiner tui_joiner(tui_thread, [&tui]() { tui.stop(); });
-#endif
-
-#ifdef WITH_DIAG
-    // Pull the multi_usrp handle out of the receiver to read RSSI. Requires
-    // the get_multi_usrp() accessor chain on usrp/receiver_chain/receiver.
-    stats::LinkDiagnostics diag(rx.get_multi_usrp(), g_stats, /*chan=*/0);
-    g_diag_ptr = &diag;
-    // If a TUI or overlay is showing RSSI/verdict, silence the diagnostic's
-    // per-second console line — the data appears on the display instead, and
-    // console output would scramble the TUI's cursor-positioned screen.
-#if defined(WITH_TUI) || defined(WITH_OVERLAY)
-    diag.set_console_output(false);
-#endif
-    std::thread diag_thread([&diag]() { diag.run(); });
-    ThreadJoiner diag_joiner(diag_thread, [&diag]() { diag.stop(); });
-#endif
-
-    cv::namedWindow("fun_ofdm video", cv::WINDOW_AUTOSIZE);
+    cv::namedWindow("fun_ofdm H.265 RX", cv::WINDOW_AUTOSIZE);
 #ifndef WITH_TUI
     std::cout << "Press 'q' in the video window to quit.\n";
 #endif
 
-#ifdef WITH_OVERLAY
-    stats::LinkOverlay overlay(g_stats, stats::TuiMode::RX);
-#endif
-
+    // Main loop: pull decoded frames and display. The receive happens on
+    // fun_ofdm's callback thread; decoded frames surface here.
     while (!g_stop.load()) {
-        std::vector<unsigned char> jpeg;
-        {
-            std::unique_lock<std::mutex> lk(g_queue_mu);
-            g_queue_cv.wait_for(lk, std::chrono::milliseconds(100),
-                                [] { return !g_jpeg_queue.empty() ||
-                                            g_stop.load(); });
-            if (!g_jpeg_queue.empty()) {
-                jpeg = std::move(g_jpeg_queue.front());
-                g_jpeg_queue.pop();
-            }
+        cv::Mat frame = g_decoder.try_pull();
+        if (!frame.empty()) {
+            cv::imshow("fun_ofdm H.265 RX", frame);
         }
-
-        if (!jpeg.empty()) {
-            cv::Mat frame = cv::imdecode(jpeg, cv::IMREAD_COLOR);
-            if (!frame.empty()) {
-#ifdef WITH_OVERLAY
-                overlay.render(frame);
-#endif
-                cv::imshow("fun_ofdm video", frame);
-#ifdef WITH_STATS
-                g_stats.note_video_frame_displayed(jpeg.size());
-#endif
-            } else {
-#ifndef WITH_TUI
-                std::cerr << "WARN: JPEG decode failed ("
-                          << jpeg.size() << " B)\n";
-#endif
-            }
-        }
-
         int key = cv::waitKey(1);
         if (key == 'q' || key == 27) g_stop = true;
+        if (frame.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     rx.pause();
+    g_decoder.stop();
     cv::destroyAllWindows();
-
-    // Signal the worker threads to stop. The ThreadJoiner guards declared
-    // earlier will join() them as they go out of scope at function return,
-    // so we must NOT join here (that would double-join). Stopping is enough.
-#ifdef WITH_DIAG
-    diag.stop();
-#endif
 #ifdef WITH_TUI
     tui.stop();
+    tui_thread.join();
 #endif
     return 0;
 }
