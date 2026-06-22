@@ -68,8 +68,8 @@ namespace fun
 
            // m_usrp->set_rx_agc(true);
             // Set analog filter bandwidth to match the OFDM signal width.
-            m_usrp->set_tx_bandwidth(params.rate * 1.5);
-            m_usrp->set_rx_bandwidth(params.rate * 1.5);
+            m_usrp->set_tx_bandwidth(params.rate * 2.5);
+            m_usrp->set_rx_bandwidth(params.rate * 2.5);
 
             m_usrp->set_rx_dc_offset(true);      // enable auto DC offset correction
            m_usrp->set_rx_iq_balance(true,uhd::usrp::multi_usrp::ALL_CHANS);     // enable auto IQ balance correction
