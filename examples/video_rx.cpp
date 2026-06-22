@@ -20,6 +20,7 @@
 #include <chrono>
 #include <atomic>
 #include <csignal>
+#include <functional>
 #include <thread>
 #include <arpa/inet.h>
 
@@ -33,25 +34,22 @@
 #  include "fec_decoder.h"
 #endif
 
-#ifdef WITH_TUI
+// WITH_STATS is true when ANY consumer of LinkStats is enabled (TUI, the
+// RSSI diagnostic, or the on-video overlay). The g_stats counters and object
+// are guarded by it; link_stats.h is included once here.
+#if defined(WITH_TUI) || defined(WITH_DIAG) || defined(WITH_OVERLAY)
+#  define WITH_STATS
 #  include "link_stats.h"
-#  include "link_tui.h"
 #endif
 
-// Diagnostics (RSSI + error-rate). Needs the stats object too, so pull in
-// link_stats.h if DIAG is on without TUI.
-#if defined(WITH_DIAG) && !defined(WITH_TUI)
-#  include "link_stats.h"
+#ifdef WITH_TUI
+#  include "link_tui.h"
 #endif
 #ifdef WITH_DIAG
 #  include "link_diagnostics.h"
 #endif
-
-// Convenience: WITH_STATS is true when ANY consumer of LinkStats is enabled.
-// All g_stats.note_*() counter calls are guarded by this so the counters are
-// populated for the TUI and/or the diagnostic thread.
-#if defined(WITH_TUI) || defined(WITH_DIAG)
-#  define WITH_STATS
+#ifdef WITH_OVERLAY
+#  include "link_overlay.h"
 #endif
 
 using namespace fun;
@@ -73,11 +71,14 @@ static_assert(fec::SYMBOL_SIZE >= PACKET_SIZE,
 static fec::FecDecoder g_dec;
 #endif
 
-#if defined(WITH_TUI) || defined(WITH_DIAG)
+#ifdef WITH_STATS
 static stats::LinkStats g_stats;
 #endif
 #ifdef WITH_TUI
 static stats::LinkTui*  g_tui_ptr = nullptr;
+#endif
+#ifdef WITH_DIAG
+static stats::LinkDiagnostics* g_diag_ptr = nullptr;
 #endif
 
 // ---------------------------------------------------------------------------
@@ -103,7 +104,26 @@ static void on_signal(int) {
 #ifdef WITH_TUI
     if (g_tui_ptr) g_tui_ptr->stop();
 #endif
+#ifdef WITH_DIAG
+    if (g_diag_ptr) g_diag_ptr->stop();
+#endif
 }
+
+// RAII guard: stops and joins a std::thread in its destructor if still
+// joinable, so a thread can never be destroyed while running (which would
+// call std::terminate / abort) and join never hangs (because we stop first).
+// Used for the TUI and diagnostic threads so any exit path — normal,
+// exception, or signal — cleans them up safely.
+struct ThreadJoiner {
+    std::thread& t;
+    std::function<void()> stopper;
+    ThreadJoiner(std::thread& th, std::function<void()> stop)
+        : t(th), stopper(std::move(stop)) {}
+    ~ThreadJoiner() {
+        if (stopper) stopper();
+        if (t.joinable()) t.join();
+    }
+};
 
 // ---------------------------------------------------------------------------
 static void flush_frame(uint32_t frame_id, PartialFrame& pf)
@@ -122,12 +142,12 @@ static void flush_frame(uint32_t frame_id, PartialFrame& pf)
     g_last_displayed_frame_id = frame_id;
     g_have_displayed = true;
 }
-static int dbg = 0;
+
 // ---------------------------------------------------------------------------
 static void process_app_packet(const std::vector<unsigned char>& pkt)
 {
     if (pkt.size() != PACKET_SIZE) {
-#if defined(WITH_TUI) || defined(WITH_DIAG)
+#ifdef WITH_STATS
         g_stats.note_phy_packet_rejected();
 #endif
         return;
@@ -141,13 +161,13 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
     std::memcpy(&payload_sz_n, &pkt[12], 2);
 
     if (ntohl(magic_n) != MAGIC) {
-#if defined(WITH_TUI) || defined(WITH_DIAG)
+#ifdef WITH_STATS
         g_stats.note_phy_packet_rejected();
 #endif
         return;
     }
 
-#if defined(WITH_TUI) || defined(WITH_DIAG)
+#ifdef WITH_STATS
     g_stats.note_app_packet_rx();
 #endif
 
@@ -191,7 +211,7 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
 static void rx_callback(std::vector<std::vector<unsigned char>> packets)
 {
     for (auto& pkt : packets) {
-#if defined(WITH_TUI) || defined(WITH_DIAG)
+#ifdef WITH_STATS
         g_stats.note_phy_packet_rx();
 #endif
 #ifdef WITH_FEC
@@ -210,7 +230,7 @@ static void rx_callback(std::vector<std::vector<unsigned char>> packets)
         bool superseded = g_have_displayed &&
                           (it->first + 30 < g_last_displayed_frame_id);
         if (too_old || superseded) {
-#if defined(WITH_TUI) || defined(WITH_DIAG)
+#ifdef WITH_STATS
             g_stats.note_video_frame_dropped();
 #endif
             it = g_partials.erase(it);
@@ -231,6 +251,9 @@ int main(int /*argc*/, char** /*argv*/)
 #ifdef WITH_DIAG
               << " [DIAG]"
 #endif
+#ifdef WITH_OVERLAY
+              << " [OVERLAY]"
+#endif
               << "\n";
 
     std::signal(SIGINT,  on_signal);
@@ -238,38 +261,52 @@ int main(int /*argc*/, char** /*argv*/)
 
     set_realtime_priority(1.0f);
 
-#ifdef WITH_TUI
-#  ifdef WITH_FEC
+    // Feed FEC decode/drop counts into the stats (used by TUI error-rate and
+    // the diagnostic). Safe to call regardless of which consumers are built.
+#if defined(WITH_FEC) && defined(WITH_STATS)
     g_dec.set_stats(&g_stats);
-#  endif
-    stats::LinkTui tui(g_stats, stats::TuiMode::RX);
-    g_tui_ptr = &tui;
-    std::thread tui_thread([&tui]() { tui.run(); });
 #endif
 
+    // Construct the receiver (and thus the USRP) FIRST, before starting any
+    // worker threads. If device setup throws, we exit here with no threads
+    // alive — avoiding the abort that occurs when a joinable std::thread is
+    // destroyed during stack unwinding.
     receiver rx(&rx_callback, FREQ, SAMPLE_RATE, RX_GAIN,
                 "type=b200,serial=314C000,num_recv_frames=700,"
                 "num_send_frames=700,recv_frame_size=11000,"
                 "send_frame_size=11000");
 
-#ifdef WITH_DIAG
-#  ifdef WITH_FEC
-    g_dec.set_stats(&g_stats);   // FEC decode/drop counts feed the error rate
-#  endif
-    // Pull the multi_usrp handle out of the receiver to read RSSI. This call
-    // requires the get_multi_usrp() accessor chain added to usrp.h,
-    // receiver_chain.h, and receiver.h (see DIAGNOSTICS_INTEGRATION notes).
-    stats::LinkDiagnostics diag(rx.get_multi_usrp(), g_stats, /*chan=*/0);
-    std::thread diag_thread([&diag]() { diag.run(); });
+    // Now the device is up, start the worker threads. Each is wrapped in a
+    // ThreadJoiner so it is always joined on any exit path.
+#ifdef WITH_TUI
+    stats::LinkTui tui(g_stats, stats::TuiMode::RX);
+    g_tui_ptr = &tui;
+    std::thread tui_thread([&tui]() { tui.run(); });
+    ThreadJoiner tui_joiner(tui_thread, [&tui]() { tui.stop(); });
 #endif
 
-#ifdef WITH_TUI
-    // With the TUI taking the terminal, we don't want OpenCV to spam the
-    // terminal too. But we still need a window for the video.
+#ifdef WITH_DIAG
+    // Pull the multi_usrp handle out of the receiver to read RSSI. Requires
+    // the get_multi_usrp() accessor chain on usrp/receiver_chain/receiver.
+    stats::LinkDiagnostics diag(rx.get_multi_usrp(), g_stats, /*chan=*/0);
+    g_diag_ptr = &diag;
+    // If a TUI or overlay is showing RSSI/verdict, silence the diagnostic's
+    // per-second console line — the data appears on the display instead, and
+    // console output would scramble the TUI's cursor-positioned screen.
+#if defined(WITH_TUI) || defined(WITH_OVERLAY)
+    diag.set_console_output(false);
+#endif
+    std::thread diag_thread([&diag]() { diag.run(); });
+    ThreadJoiner diag_joiner(diag_thread, [&diag]() { diag.stop(); });
+#endif
+
     cv::namedWindow("fun_ofdm video", cv::WINDOW_AUTOSIZE);
-#else
-    cv::namedWindow("fun_ofdm video", cv::WINDOW_AUTOSIZE);
+#ifndef WITH_TUI
     std::cout << "Press 'q' in the video window to quit.\n";
+#endif
+
+#ifdef WITH_OVERLAY
+    stats::LinkOverlay overlay(g_stats, stats::TuiMode::RX);
 #endif
 
     while (!g_stop.load()) {
@@ -288,8 +325,11 @@ int main(int /*argc*/, char** /*argv*/)
         if (!jpeg.empty()) {
             cv::Mat frame = cv::imdecode(jpeg, cv::IMREAD_COLOR);
             if (!frame.empty()) {
+#ifdef WITH_OVERLAY
+                overlay.render(frame);
+#endif
                 cv::imshow("fun_ofdm video", frame);
-#if defined(WITH_TUI) || defined(WITH_DIAG)
+#ifdef WITH_STATS
                 g_stats.note_video_frame_displayed(jpeg.size());
 #endif
             } else {
@@ -307,14 +347,14 @@ int main(int /*argc*/, char** /*argv*/)
     rx.pause();
     cv::destroyAllWindows();
 
+    // Signal the worker threads to stop. The ThreadJoiner guards declared
+    // earlier will join() them as they go out of scope at function return,
+    // so we must NOT join here (that would double-join). Stopping is enough.
 #ifdef WITH_DIAG
     diag.stop();
-    diag_thread.join();
 #endif
-
 #ifdef WITH_TUI
     tui.stop();
-    tui_thread.join();
 #endif
     return 0;
 }
