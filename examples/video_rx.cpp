@@ -366,6 +366,15 @@ int main(int /*argc*/, char** /*argv*/)
 #ifdef WITH_TUI
               << " [TUI]"
 #endif
+#ifdef WITH_DIAG
+              << " [DIAG]"
+#endif
+#ifdef WITH_AGC
+              << " [AGC]"
+#endif
+#ifdef WITH_OVERLAY
+              << " [OVERLAY]"
+#endif
               << "\n";
 
     std::signal(SIGINT,  on_signal);
@@ -378,22 +387,55 @@ int main(int /*argc*/, char** /*argv*/)
         return 1;
     }
 
-#ifdef WITH_FEC
-#  ifdef WITH_TUI
+    // Feed FEC decode/drop counts into the stats (TUI error-rate + diagnostic).
+#if defined(WITH_FEC) && defined(WITH_STATS)
     g_dec.set_stats(&g_stats);
-#  endif
 #endif
 
-#ifdef WITH_TUI
-    stats::LinkTui tui(g_stats, stats::TuiMode::RX);
-    g_tui_ptr = &tui;
-    std::thread tui_thread([&tui]() { tui.run(); });
-#endif
-
+    // Construct the receiver (and USRP) FIRST, before any worker threads, so a
+    // device-init failure can't leave a running thread to be destroyed (abort).
     receiver rx(&rx_callback, FREQ, SAMPLE_RATE, RX_GAIN,
                 "type=b200,serial=314C000,num_recv_frames=700,"
                 "num_send_frames=700,recv_frame_size=11000,"
                 "send_frame_size=11000");
+
+    // ---- worker threads, each guarded by a ThreadJoiner ----
+#ifdef WITH_TUI
+    stats::LinkTui tui(g_stats, stats::TuiMode::RX);
+    g_tui_ptr = &tui;
+    std::thread tui_thread([&tui]() { tui.run(); });
+    ThreadJoiner tui_joiner(tui_thread, [&tui]() { tui.stop(); });
+#endif
+
+#ifdef WITH_DIAG
+    stats::LinkDiagnostics diag(rx.get_multi_usrp(), g_stats, /*chan=*/0);
+    g_diag_ptr = &diag;
+#  if defined(WITH_TUI) || defined(WITH_OVERLAY)
+    diag.set_console_output(false);   // display shows it instead
+#  endif
+    std::thread diag_thread([&diag]() { diag.run(); });
+    ThreadJoiner diag_joiner(diag_thread, [&diag]() { diag.stop(); });
+#endif
+
+#ifdef WITH_AGC
+    // Slow software AGC: keeps RSSI in a target window by nudging RX gain ~1Hz.
+    // Owns the gain (don't also enable UHD AGC). Parameters match the design.
+    stats::LinkAgc agc(rx.get_multi_usrp(), g_stats, /*chan=*/0);
+    agc.set_window(-60.0, -35.0);
+    agc.set_gain_band(10.0, 60.0);
+    agc.set_step_db(1.0);
+    agc.set_period_ms(1000);
+    g_agc_ptr = &agc;
+#  if defined(WITH_TUI) || defined(WITH_OVERLAY)
+    agc.set_console_output(false);
+#  endif
+    std::thread agc_thread([&agc]() { agc.run(); });
+    ThreadJoiner agc_joiner(agc_thread, [&agc]() { agc.stop(); });
+#endif
+
+#ifdef WITH_OVERLAY
+    stats::LinkOverlay overlay(g_stats, stats::TuiMode::RX);
+#endif
 
     cv::namedWindow("fun_ofdm H.265 RX", cv::WINDOW_AUTOSIZE);
 #ifndef WITH_TUI
@@ -405,6 +447,9 @@ int main(int /*argc*/, char** /*argv*/)
     while (!g_stop.load()) {
         cv::Mat frame = g_decoder.try_pull();
         if (!frame.empty()) {
+#ifdef WITH_OVERLAY
+            overlay.render(frame);   // draw RSSI/verdict/gain HUD on the video
+#endif
             cv::imshow("fun_ofdm H.265 RX", frame);
         }
         int key = cv::waitKey(1);
@@ -416,9 +461,16 @@ int main(int /*argc*/, char** /*argv*/)
     rx.pause();
     g_decoder.stop();
     cv::destroyAllWindows();
+
+    // Signal worker threads to stop; ThreadJoiners join them at scope exit.
+#ifdef WITH_DIAG
+    diag.stop();
+#endif
+#ifdef WITH_AGC
+    agc.stop();
+#endif
 #ifdef WITH_TUI
     tui.stop();
-    tui_thread.join();
 #endif
     return 0;
 }
