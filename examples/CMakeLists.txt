@@ -98,9 +98,16 @@ add_executable(video_rx video_rx.cpp)
 target_link_libraries(video_tx fun_ofdm ${OpenCV_LIBS})
 target_link_libraries(video_rx fun_ofdm ${OpenCV_LIBS})
 
-# Things that apply when either FEC or TUI is on (C++14, threads, local hdrs)
+# GStreamer applies to BOTH bridges UNCONDITIONALLY (even a bare build uses it).
 foreach(tgt video_tx video_rx)
-    if(WITH_FEC OR WITH_TUI OR WITH_OVERLAY)
+    target_include_directories(${tgt} PRIVATE ${GST_INCLUDE_DIRS})
+    target_link_libraries(${tgt} ${GST_LIBRARIES})
+    target_compile_options(${tgt} PRIVATE ${GST_CFLAGS_OTHER})
+endforeach()
+
+# C++14 + threads + local headers whenever ANY instrumentation/FEC is on.
+foreach(tgt video_tx video_rx)
+    if(WITH_FEC OR WITH_TUI OR WITH_OVERLAY OR WITH_DIAG OR WITH_AGC)
         target_compile_features(${tgt} PRIVATE cxx_std_14)
         target_include_directories(${tgt} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR})
