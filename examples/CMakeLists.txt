@@ -53,7 +53,6 @@ if(WITH_FEC)
                 "Pass -DLIBRAPTORQ_DIR=/path/to/libRaptorQ/src")
     endif()
 
-    # libRaptorQ needs Eigen3. Prefer system, fall back to bundled copy.
     find_path(EIGEN3_INCLUDE_DIR Eigen/Core
             PATHS /usr/include/eigen3 /usr/local/include/eigen3
             "${LIBRAPTORQ_DIR}/../external/eigen3")
@@ -65,12 +64,11 @@ if(WITH_FEC)
     message(STATUS "FEC enabled")
     message(STATUS "  libRaptorQ: ${LIBRAPTORQ_DIR}")
     message(STATUS "  Eigen3:     ${EIGEN3_INCLUDE_DIR}")
-
-
 endif()
 if(WITH_TUI)
     message(STATUS "TUI enabled")
 endif()
+
 ########################################################################
 # Original test executables
 ########################################################################
