@@ -1,9 +1,18 @@
 ########################################################################
-# Examples CMakeLists.txt — with optional RaptorQ FEC for video bridges
+# Examples CMakeLists.txt — RaptorQ FEC + TUI + DIAG + AGC + OVERLAY,
+# plus GStreamer for the H.265 video bridges.
 ########################################################################
 cmake_policy(SET CMP0167 OLD)
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
+
+########################################################################
+# GStreamer — REQUIRED by the H.265 video_tx/video_rx (encode/decode
+# pipelines). Without this block the compiler never gets the -I path to
+# gst/gst.h even though the dev packages are installed.
+########################################################################
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0)
 
 ########################################################################
 # Include directories so cmake knows where .h files live
@@ -11,19 +20,21 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/src)
 
 ########################################################################
-# FEC + TUI configuration
+# Feature flags
 #
-#   cmake ..                                          # baseline, no extras
-#   cmake -DWITH_TUI=ON ..                            # terminal stats only
-#   cmake -DWITH_FEC=ON -DLIBRAPTORQ_DIR=... ..       # FEC only
-#   cmake -DWITH_FEC=ON -DWITH_TUI=ON -DLIBRAPTORQ_DIR=... ..   # both
+#   cmake ..                                          # baseline
+#   cmake -DWITH_TUI=ON ..                            # terminal stats
+#   cmake -DWITH_FEC=ON -DLIBRAPTORQ_DIR=... ..       # FEC
+#   cmake -DWITH_FEC=ON -DWITH_TUI=ON -DWITH_DIAG=ON -DWITH_AGC=ON \
+#         -DWITH_OVERLAY=ON -DLIBRAPTORQ_DIR=... ..   # everything (RX)
 #
-# The shim headers (fec_*.h, link_*.h) live in this examples/ directory.
+# Shim headers (fec_*.h, link_*.h, video_packet.h) live in this examples/ dir.
 ########################################################################
 option(WITH_FEC "Build video bridges with RaptorQ FEC" OFF)
 option(WITH_TUI "Build video bridges with terminal link-health display" OFF)
 option(WITH_OVERLAY "Build video_rx with on-video HUD overlay" OFF)
 option(WITH_DIAG "Build video_rx with the RSSI/error diagnostic thread" OFF)
+option(WITH_AGC "Build video_rx with the software AGC" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -79,7 +90,7 @@ target_link_libraries(receiver    fun_ofdm)
 target_link_libraries(transceiver fun_ofdm)
 
 ########################################################################
-# Video bridges — FEC and TUI both optional
+# Video bridges (H.265). GStreamer is ALWAYS needed; FEC/TUI/etc optional.
 ########################################################################
 add_executable(video_tx video_tx.cpp)
 add_executable(video_rx video_rx.cpp)
