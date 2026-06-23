@@ -29,6 +29,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <functional>
 #include <arpa/inet.h>
 
 #include <opencv2/opencv.hpp>
@@ -95,7 +96,23 @@ static void on_signal(int) {
 #ifdef WITH_TUI
     if (g_tui_ptr) g_tui_ptr->stop();
 #endif
+#ifdef WITH_DIAG
+    if (g_diag_ptr) g_diag_ptr->stop();
+#endif
+#ifdef WITH_AGC
+    if (g_agc_ptr) g_agc_ptr->stop();
+#endif
 }
+
+// RAII guard: stops then joins a thread on any exit path, so a running thread
+// is never destroyed (which would abort) and join never hangs.
+struct ThreadJoiner {
+    std::thread& t;
+    std::function<void()> stopper;
+    ThreadJoiner(std::thread& th, std::function<void()> stop)
+        : t(th), stopper(std::move(stop)) {}
+    ~ThreadJoiner() { if (stopper) stopper(); if (t.joinable()) t.join(); }
+};
 
 // ===========================================================================
 //  H.265 decode pipeline (GStreamer, software decode)
