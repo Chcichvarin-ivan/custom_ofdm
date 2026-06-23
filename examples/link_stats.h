@@ -72,6 +72,13 @@ public:
     void update_verdict(LinkVerdict v) {
         m_verdict.store(static_cast<int>(v), std::memory_order_relaxed);
     }
+    // Current RX gain in dB, written by the AGC (if running) so the TUI/overlay
+    // can display it. Stored as milli-dB to stay atomic-friendly.
+    void update_rx_gain_db(double db) {
+        m_rx_gain_mdb.store(static_cast<int64_t>(db * 1000.0),
+                            std::memory_order_relaxed);
+        m_have_gain.store(true, std::memory_order_relaxed);
+    }
 
     // ---- Snapshot for the TUI ----
     struct Snapshot {
@@ -105,6 +112,8 @@ public:
         bool        have_rssi = false;
         double      rssi_dbm  = 0.0;
         LinkVerdict verdict   = LinkVerdict::Unknown;
+        bool        have_gain = false;
+        double      rx_gain_db = 0.0;
     };
 
     Snapshot sample() {
@@ -192,6 +201,8 @@ public:
         s.rssi_dbm  = m_rssi_mdbm.load(std::memory_order_relaxed) / 1000.0;
         s.verdict   = static_cast<LinkVerdict>(
                           m_verdict.load(std::memory_order_relaxed));
+        s.have_gain  = m_have_gain.load(std::memory_order_relaxed);
+        s.rx_gain_db = m_rx_gain_mdb.load(std::memory_order_relaxed) / 1000.0;
         return s;
     }
 
@@ -215,6 +226,8 @@ private:
     std::atomic<int64_t> m_rssi_mdbm{0};      // RSSI * 1000, milli-dBm
     std::atomic<bool>    m_have_rssi{false};
     std::atomic<int>     m_verdict{0};        // LinkVerdict as int
+    std::atomic<int64_t> m_rx_gain_mdb{0};    // RX gain * 1000, milli-dB
+    std::atomic<bool>    m_have_gain{false};
 
     std::mutex m_mu;
     std::chrono::steady_clock::time_point m_start;
