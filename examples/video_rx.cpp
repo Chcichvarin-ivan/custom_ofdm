@@ -45,9 +45,25 @@
 #  include "fec_decoder.h"
 #endif
 
-#ifdef WITH_TUI
+// WITH_STATS is true when ANY consumer of LinkStats is enabled (TUI, the RSSI
+// diagnostic, the on-video overlay, or the AGC). The g_stats counters and
+// object are guarded by it; link_stats.h is included once here.
+#if defined(WITH_TUI) || defined(WITH_DIAG) || defined(WITH_OVERLAY) || defined(WITH_AGC)
+#  define WITH_STATS
 #  include "link_stats.h"
+#endif
+
+#ifdef WITH_TUI
 #  include "link_tui.h"
+#endif
+#ifdef WITH_DIAG
+#  include "link_diagnostics.h"
+#endif
+#ifdef WITH_AGC
+#  include "link_agc.h"
+#endif
+#ifdef WITH_OVERLAY
+#  include "link_overlay.h"
 #endif
 
 using namespace fun;
@@ -60,9 +76,17 @@ static const double RX_GAIN     = 10.0;
 #ifdef WITH_FEC
 static fec::FecDecoder g_dec;
 #endif
-#ifdef WITH_TUI
+#ifdef WITH_STATS
 static stats::LinkStats g_stats;
+#endif
+#ifdef WITH_TUI
 static stats::LinkTui*  g_tui_ptr = nullptr;
+#endif
+#ifdef WITH_DIAG
+static stats::LinkDiagnostics* g_diag_ptr = nullptr;
+#endif
+#ifdef WITH_AGC
+static stats::LinkAgc* g_agc_ptr = nullptr;
 #endif
 static std::atomic<bool> g_stop{false};
 
@@ -201,7 +225,7 @@ static void deliver_frame(uint32_t frame_id, PartialFrame& pf)
     if (g_need_keyframe) {
         if (!pf.is_keyframe) {
             // Still waiting for a clean restart point; drop this delta frame.
-#ifdef WITH_TUI
+#ifdef WITH_STATS
             g_stats.note_video_frame_dropped();
 #endif
             return;
@@ -213,7 +237,7 @@ static void deliver_frame(uint32_t frame_id, PartialFrame& pf)
     g_decoder.push(frame);
     g_last_pushed_frame = frame_id;
     g_have_pushed = true;
-#ifdef WITH_TUI
+#ifdef WITH_STATS
     g_stats.note_video_frame_displayed(frame.size());
 #endif
 }
@@ -223,7 +247,7 @@ static void deliver_frame(uint32_t frame_id, PartialFrame& pf)
 static void note_incomplete_frame()
 {
     g_need_keyframe = true;
-#ifdef WITH_TUI
+#ifdef WITH_STATS
     g_stats.note_video_frame_dropped();
 #endif
 }
@@ -231,7 +255,7 @@ static void note_incomplete_frame()
 static void process_app_packet(const std::vector<unsigned char>& pkt)
 {
     if (pkt.size() != vid::PACKET_SIZE) {
-#ifdef WITH_TUI
+#ifdef WITH_STATS
         g_stats.note_phy_packet_rejected();
 #endif
         return;
@@ -239,7 +263,7 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
     uint32_t magic_n;
     std::memcpy(&magic_n, &pkt[vid::OFF_MAGIC], 4);
     if (ntohl(magic_n) != vid::MAGIC) {
-#ifdef WITH_TUI
+#ifdef WITH_STATS
         g_stats.note_phy_packet_rejected();
 #endif
         return;
@@ -261,7 +285,7 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
     if (total_chunks == 0 || chunk_index >= total_chunks) return;
     if (payload_sz > vid::PAYLOAD_SIZE) return;
 
-#ifdef WITH_TUI
+#ifdef WITH_STATS
     g_stats.note_app_packet_rx();
 #endif
 
@@ -302,7 +326,7 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
 static void rx_callback(std::vector<std::vector<unsigned char>> packets)
 {
     for (auto& pkt : packets) {
-#ifdef WITH_TUI
+#ifdef WITH_STATS
         g_stats.note_phy_packet_rx();
 #endif
 #ifdef WITH_FEC
