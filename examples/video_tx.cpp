@@ -1,15 +1,19 @@
 /*!
  * \file video_tx.cpp
- * \brief H.265 video TX over fun_ofdm (Radxa RK3588, hardware VPU encode).
+ * \brief H.265 video TX over fun_ofdm — runs on Radxa (hardware encode) OR
+ *        x86 (software encode), auto-detecting which encoder is available.
  *
  *   -DWITH_FEC enables RaptorQ FEC (must match the RX build). STRONGLY
  *              recommended for H.265 — see note below.
  *   -DWITH_TUI enables the terminal link-health display.
  *
- * Captures from the camera, encodes to H.265 on the RK3588 hardware encoder
- * (mpph265enc) via a GStreamer pipeline that delivers compressed frames to an
- * appsink, then packetizes each compressed frame over fun_ofdm. A keyframe
- * flag is set in the packet header so the RX can resync after loss.
+ * Captures from the camera, encodes to H.265, packetizes each compressed frame
+ * over fun_ofdm. Encoder is chosen at runtime:
+ *   - mpph265enc (RK3588 hardware VPU) if present — the Radxa.
+ *   - x265enc (software, ultrafast) otherwise — x86 or any board without the
+ *     Rockchip encoder. Software encode uses real CPU; fine for 720p on a
+ *     decent x86 box, but it's not free like the VPU.
+ * A keyframe flag is set in the packet header so the RX can resync after loss.
  *
  * WHY FEC MATTERS HERE: H.265 delta frames reference earlier frames, so a
  * single lost packet corrupts video until the next keyframe. Testing showed
@@ -183,31 +187,61 @@ int main(int /*argc*/, char** /*argv*/)
     std::thread tui_thread([&tui]() { tui.run(); });
 #endif
 
-    // ---- Build the hardware-encode pipeline ending in appsink ----
-    // mpph265enc = RK3588 hardware HEVC encoder.
-    //   bps      : target bitrate
-    //   rc-mode  : vbr (variable, quality-priority within the budget)
-    //   gop      : keyframe interval (SEE NOTE: verify property name on your
-    //              build via `gst-inspect-1.0 mpph265enc`)
-    // h265parse with config-interval=1 re-sends SPS/PPS with every keyframe so
-    // the decoder can start/resync mid-stream — important for a lossy link.
+    // ---- Build the encode pipeline, auto-detecting the encoder ----
+    // On the Radxa, mpph265enc (hardware VPU) is available — use it. On x86 it
+    // isn't, so fall back to x265enc (software, ultrafast preset for real-time).
+    // The rest of the pipeline (capture, parse, appsink) is identical; only the
+    // encoder element and its property names differ.
     char desc[1024];
-    std::snprintf(desc, sizeof(desc),
-        "v4l2src device=%s ! "
-        "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1 ! "
-        "mpph265enc bps=%d rc-mode=vbr gop=%d ! "
-        "h265parse config-interval=1 ! "
-        "video/x-h265,stream-format=byte-stream,alignment=au ! "
-        "appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true",
-        CAM_DEVICE, FRAME_W, FRAME_H, TARGET_FPS, BPS, GOP);
+    bool have_hw =
+        (gst_element_factory_find("mpph265enc") != nullptr);
+
+    if (have_hw) {
+        // Hardware path (Radxa RK3588 VPU).
+        //   bps = bitrate (bits/s), rc-mode vbr, gop = keyframe interval.
+        //   (If 'gop' is the wrong property name on your build, change it here;
+        //    check `gst-inspect-1.0 mpph265enc | grep -iE "gop|key"`.)
+        std::snprintf(desc, sizeof(desc),
+            "v4l2src device=%s ! "
+            "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1 ! "
+            "mpph265enc bps=%d rc-mode=vbr gop=%d ! "
+            "h265parse config-interval=1 ! "
+            "video/x-h265,stream-format=byte-stream,alignment=au ! "
+            "appsink name=sink emit-signals=false sync=false "
+            "max-buffers=4 drop=true",
+            CAM_DEVICE, FRAME_W, FRAME_H, TARGET_FPS, BPS, GOP);
+        std::cout << "Encoder: mpph265enc (HARDWARE / RK3588 VPU)\n";
+    } else {
+        // Software path (x86 or any board without the Rockchip encoder).
+        //   x265enc: bitrate is in KBIT/s (not bits), key-int-max = keyframe
+        //   interval in frames, speed-preset=ultrafast keeps it real-time.
+        //   x265enc wants I420 input, so the caps request I420 (videoconvert
+        //   bridges whatever the camera gives).
+        std::snprintf(desc, sizeof(desc),
+            "v4l2src device=%s ! "
+            "video/x-raw,width=%d,height=%d,framerate=%d/1 ! "
+            "videoconvert ! video/x-raw,format=I420 ! "
+            "x265enc bitrate=%d key-int-max=%d speed-preset=ultrafast "
+            "tune=zerolatency ! "
+            "h265parse config-interval=1 ! "
+            "video/x-h265,stream-format=byte-stream,alignment=au ! "
+            "appsink name=sink emit-signals=false sync=false "
+            "max-buffers=4 drop=true",
+            CAM_DEVICE, FRAME_W, FRAME_H, TARGET_FPS, (BPS / 1000), GOP);
+        std::cout << "Encoder: x265enc (SOFTWARE, ultrafast). "
+                     "mpph265enc not found — this is expected on x86.\n";
+    }
 
     GError* err = nullptr;
     GstElement* pipeline = gst_parse_launch(desc, &err);
     if (!pipeline) {
         std::cerr << "Encode pipeline failed: "
                   << (err ? err->message : "?") << "\n";
-        std::cerr << "If it's the 'gop' property, run "
-                     "`gst-inspect-1.0 mpph265enc` and use the right name.\n";
+        if (have_hw)
+            std::cerr << "If it's the 'gop' property, run "
+                         "`gst-inspect-1.0 mpph265enc` and use the right name.\n";
+        else
+            std::cerr << "Is gstreamer1.0-plugins-bad (x265enc) installed?\n";
         if (err) g_error_free(err);
         return 1;
     }
