@@ -125,13 +125,13 @@ foreach(tgt video_tx video_rx)
     endif()
 endforeach()
 
+# RX-only feature definitions.
 if(WITH_OVERLAY)
     target_compile_definitions(video_rx PRIVATE WITH_OVERLAY)
 endif()
-
 if(WITH_DIAG)
-         target_compile_definitions(video_rx PRIVATE WITH_DIAG)
-         # video_rx already links fun_ofdm which brings UHD; if you get UHD
-         # header errors, also:  find_package(UHD REQUIRED) and
-         # target_link_libraries(video_rx ${UHD_LIBRARIES})
+    target_compile_definitions(video_rx PRIVATE WITH_DIAG)
+endif()
+if(WITH_AGC)
+    target_compile_definitions(video_rx PRIVATE WITH_AGC)
 endif()
