@@ -66,7 +66,7 @@ namespace fun
            // m_usrp->set_tx_antenna("TX/RX");
             m_usrp->set_rx_antenna("RX2");  // separate RX port; better isolation than TX/RX
 
-           // m_usrp->set_rx_agc(true);
+            m_usrp->set_rx_agc(true);
             // Set analog filter bandwidth to match the OFDM signal width.
             m_usrp->set_tx_bandwidth(params.rate * 2.5);
             m_usrp->set_rx_bandwidth(params.rate * 2.5);
