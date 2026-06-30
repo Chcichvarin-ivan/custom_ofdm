@@ -72,7 +72,7 @@ using namespace fun;
 // ---------------------- Radio parameters (match TX) -------------------------
 static const double FREQ        = 3.3e9;
 static const double SAMPLE_RATE = 20e6;
-static const double RX_GAIN     = 15.0;
+static const double RX_GAIN     = 10.0;
 
 #ifdef WITH_FEC
 static fec::FecDecoder g_dec;
