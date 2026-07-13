@@ -70,6 +70,37 @@ public:
             }
         } else {
             // ---- RX stats ----
+            // RF-layer line first (RSSI + verdict) — most important for
+            // diagnosing saturation vs weak signal at a glance.
+            {
+                cv::Scalar vcolor = WHITE;
+                std::string vtext;
+                switch (snap.verdict) {
+                    case stats::LinkVerdict::Healthy:
+                        vtext = "OK";       vcolor = GREEN;  break;
+                    case stats::LinkVerdict::Saturation:
+                        vtext = "SAT!";     vcolor = RED;    break;
+                    case stats::LinkVerdict::Weak:
+                        vtext = "WEAK";     vcolor = YELLOW; break;
+                    case stats::LinkVerdict::NoSignal:
+                        vtext = "NO SIG";   vcolor = RED;    break;
+                    case stats::LinkVerdict::MidErrors:
+                        vtext = "ERR";      vcolor = YELLOW; break;
+                    default:
+                        vtext = "--";       vcolor = GRAY;   break;
+                }
+                std::ostringstream lr;
+                lr << "RF     ";
+                if (snap.have_rssi) {
+                    lr << std::fixed << std::setprecision(0)
+                       << snap.rssi_dbm << "dBm ";
+                } else {
+                    lr << "--- ";
+                }
+                lr << vtext;
+                lines.push_back({lr.str(), vcolor});
+            }
+
             std::ostringstream l1;
             l1 << "PHY    " << static_cast<int>(snap.phy_pps_rx) << "/s";
             lines.push_back({l1.str(),
@@ -107,8 +138,12 @@ public:
                              color_threshold(snap.video_fps_rx, 25, 10, true)});
 
             std::ostringstream l7;
-            l7 << "Rate   " << fmt_kbps(snap.app_kbps_rx);
+            l7 << "Link   " << fmt_kbps(snap.link_kbps_rx);
             lines.push_back({l7.str(), WHITE});
+
+            std::ostringstream l8;
+            l8 << "Video  " << fmt_kbps(snap.app_kbps_rx);
+            lines.push_back({l8.str(), WHITE});
         }
 
         // Layout constants

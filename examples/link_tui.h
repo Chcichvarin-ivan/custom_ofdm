@@ -161,6 +161,11 @@ private:
             }
             o << cup(r++,1) << "  Status    : " << vcolor << vtext << RESET
               << EOL;
+            if (s.have_gain) {
+                o << cup(r++,1) << "  RX gain   : "
+                  << std::fixed << std::setprecision(0) << s.rx_gain_db
+                  << " dB" << EOL;
+            }
         }
 
         r++;
@@ -218,7 +223,10 @@ private:
               << s.video_frames_dropped << RESET << " incomplete frames"
               << EOL;
         }
-        o << cup(r++,1) << "  Bitrate   : " << fmt_kbps(s.app_kbps_rx) << EOL;
+        o << cup(r++,1) << "  Link rate : " << fmt_kbps(s.link_kbps_rx)
+          << GRAY << " received" << RESET << EOL;
+        o << cup(r++,1) << "  Video rate: " << fmt_kbps(s.app_kbps_rx)
+          << GRAY << " decoded" << RESET << EOL;
 
         r++;
         o << cup(r++,1) << DIM << "  Press 'q' in video window to quit"
