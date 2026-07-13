@@ -1,434 +1,269 @@
-# FUN OFDM #
+# custom_ofdm — Drone-to-Ground H.265 Video Link over OFDM
 
-This project is an 802.11a OFDM PHY layer implementation written in C++ for use with Ettus USRPs. It contains both transmitter and receiver blocks and were tested with USRP N210s + XCVR 2450 daughterboards. These blocks are provided separately so that they can be used individually. They can also be easily combined into a single transceiver, but that is left up to the user because how they interact with each other should be controlled by the MAC layer which is outside the scope of this project. Note: A simple transceiver example is provided in the examples directory of the project.
+A complete digital video downlink for a drone: H.265 video, RaptorQ forward
+error correction, and an 802.11a-style OFDM PHY on USRP B200 mini radios at
+3.3 GHz. **Field-proven to 2 km** at 300–400 m altitude (10 W PA on the
+aircraft, LNA on the ground) with real-time 720p video.
 
-The [Official FUN OFDM API can be found here!](http://www.ee.washington.edu/research/funlab/fun_ofdm/index.html)
+This is a heavily hardened fork of
+[bmorgan5/fun_ofdm](https://github.com/bmorgan5/fun_ofdm), the 802.11a OFDM
+PHY from the FUNLAB at the University of Washington (GPL v2). The PHY
+architecture (frame detection, timing sync, FFT, equalization, Viterti/CRC
+frame decode) is inherited; everything above it — and several critical fixes
+inside it — is this project. The original README, targeting USRP N210
+research use, is preserved as `README_upstream.md`.
 
-# Getting Set Up #
+---
 
-## Hardware Requirements ##
+## System architecture
 
-__1. USRP N2XX__
+```
+DRONE (Radxa Rock 5B, ARM)                    GROUND (x86 Linux)
+┌─────────────────────────────┐               ┌──────────────────────────────┐
+│ USB camera (MJPEG)          │               │ B200 mini ── LNA ── patch ant│
+│   └─ GStreamer decode       │               │   └─ fun_ofdm RX chain       │
+│      └─ mpph265enc (HW)     │    3.3 GHz    │      └─ FEC decoder (sync-   │
+│         └─ packetizer       │   ~~~~~~~~>   │         hardened RaptorQ)    │
+│            └─ FEC encoder   │    OFDM       │         └─ frame reassembly  │
+│               (RaptorQ)     │  QPSK 1/2     │            └─ avdec_h265     │
+│               └─ fun_ofdm TX│   10 Msps     │               └─ display+TUI │
+│                  └─ B200mini│               │                              │
+│                     └─ 10W  │               │ Pluto+ (optional, libiio)    │
+│                        PA   │               │   RX1/RX2 ─ pluto_rx ─┐      │
+└─────────────────────────────┘               │   (diversity branches │ UDP  │
+        10 MHz OCXO ref                       │    merge at FEC) <────┘      │
+        on BOTH radios                        └──────────────────────────────┘
+```
 
-This project was built for and tested with USRP N210s. It may be updated in the future to work with the B200/210's as well, but for now if you want to use B210s you will need to update the USRP class appropriately.
+Every additional ground receiver (the Pluto+ channels, or any future branch)
+runs its own complete receive chain and forwards decoded PHY packets over UDP
+into the same FEC decoder — packets are self-identifying, duplicates are
+ignored, so **whichever antenna's physics worked, its packets count**.
 
-__2. Gigabit Ethernet Port__
+## What's changed versus upstream fun_ofdm
 
-Each USRP requires its own gigabit ethernet port.
+Fixes inside the PHY (`src/`):
 
-__3. Second Generation Intel i5/i7 processor (or equivalent) and 8 GB RAM__
+* **Working CFO correction** (`timing_sync`). Upstream's frequency-offset
+  estimation loop was dead code (`for(k = LTS1; k < LTS1; ...)`) — the
+  receiver applied **no** carrier-frequency correction at all. Replaced with
+  a correct Schmidl & Cox estimate over the two LTS symbols, plus a **clip
+  gate** (never learn an estimate from a clipped preamble — a persistent
+  garbage estimate corrupts every following frame) and a **watchdog** (reset
+  to neutral after 250 ms without an LTS, so stale corrections can't outlive
+  their signal).
+* **Receive-power tap** (`frame_detector` → `rx_power_monitor.h`): publishes
+  mean sample power and a near-clip fraction from samples the detector
+  already touches. Feeds the AGC and the CFO clip gate. No hardware RSSI
+  sensor anywhere — the B200 mini's `rssi` sensor is unreadable while
+  streaming and is abandoned.
 
-The transmitter is not very computationally complex. However, the receiver runs about 6 threads with about each one performing O(N) complex multiplications each. Therefore, to run the receiver (either by itself or as part of a transceiver) it is recommended that you have at least a 2nd generation Intel i5/i7 or equivalent and at least 8 GB of RAM.
+Everything above the PHY (`examples/`):
 
+* **video_tx / video_rx** — the H.265 link itself: hardware encode on the
+  RK3588 (with a required `videoconvert` copy working around an RGA
+  file-descriptor leak that froze the encoder after ~40 s), packetization
+  with keyframes every ~15 frames, keyframe-aware queue dropping, and
+  loss-aware resync on the receive side (after any incomplete frame, drop
+  until the next keyframe).
+* **RaptorQ FEC** (`fec_encoder.h` / `fec_decoder.h`, needs libRaptorQ):
+  K source symbols + R repair per generation. The decoder is
+  **sync-hardened**: a large generation-id jump needs corroboration from
+  multiple packets before the window moves (one corrupted header can no
+  longer wedge the session), and a re-acquire watchdog self-heals a desynced
+  window — including after a TX restart — in ~1.5 s instead of requiring an
+  RX restart.
+* **Software AGC v2** (`link_agc.h`): fast-attack / slow-release on the
+  sample-power level. Emergency −6 dB on clipping (>1 % near-clip samples),
+  proportional down-steps, gain rises only after *sustained* weakness so
+  multipath fades never pump it, wide dead zone (−28…−14 dBFS). Designed for
+  a moving platform; the old 1 dB/s loop could not track motion.
+* **TUI** (`link_tui.h`): live link health — PHY packets/s, rejects, FEC
+  generations decoded/dropped, repair-symbol usage, frames/fps, link and
+  video bitrates, RX gain.
+* **Diversity receiver** (`pluto_rx.cpp`, `iio_source.*`, `diversity_rx.h`):
+  a standalone process driving a Pluto+ (AD9363, libiio, no UHD) with one
+  or two RX channels, each through its own receive chain, forwarding PHY
+  packets over UDP (localhost:5599) into video_rx's decoder. Additive by
+  design: if it dies, the main link is untouched.
+* **Optional TX interleaver** (`phy_spreader.h`): generation-id-keyed block
+  interleaver spreading burst losses across `depth` generations
+  (tolerance ≈ depth × R packets, latency ≈ depth × generation cadence).
+  Integrate only if generations drop in clumps during motion.
+* **Self-test suites** — see [Testing](#testing).
 
-## Dependencies ##
+## Hardware
 
-### CMake (>= 3.9) ###
+| | Drone (TX) | Ground (RX) |
+|---|---|---|
+| Computer | Radxa Rock 5B (RK3588) | x86 Linux |
+| Radio | USRP B200 mini | USRP B200 mini (+ optional Pluto+) |
+| RF chain | 10 W PA → **harmonic low-pass filter** → antenna | antenna → (band-pass filter) → LNA → radio |
+| Reference | 10 MHz OCXO → external ref input | 10 MHz OCXO (same family) → external ref input |
+| Camera | USB UVC, MJPEG | — |
 
-This project uses the CMake build system to check for dependencies and auto-generate all the necessary Makefiles. For more information see the [CMake Website](http://www.cmake.org/).
+**Clocking matters enormously.** Both radios run
+`set_clock_source("external")` from a 10 MHz OCXO; verify `Ref locked: yes`
+at startup on both ends. Disciplining both ends transformed link quality in
+this project's history. The optional Pluto+ takes the same 10 MHz through
+its external-clock input (EXCLK jumper to GND; either declare 10 MHz via the
+u-boot `ad936x_custom_refclk` method or translate 10→40 MHz externally).
 
-On a debian based system you can also install CMake throught apt-get such as:
+**⚠ Close-range RF safety.** With a 10 W PA and an LNA'd receiver, the RX
+front end saturates on approach inside ~200–300 m and the **B200's damage
+threshold (~+10 dBm) is approached inside ~50 m**. Never key the PA near the
+ground station; power it down for takeoff/landing/close work; plan an LNA
+bypass or step attenuator for close-range operation. A "10 W" PA is also a
+~1–2 W *OFDM* amplifier (8–10 dB peak-to-average backoff) — find the drive
+level by sweeping TX gain for maximum received packet rate, not maximum
+power; the harmonic filter after it is mandatory.
 
-~~~
-sudo apt-get install cmake
-~~~
+## Dependencies
 
-### Make ###
+Upstream set: CMake ≥ 3.9, make, **UHD**, **FFTW3**, **Boost**, pthread.
 
-Make is required for the CMake build system. More information can be found at [GNU Make homepage](http://www.gnu.org/software/make/).
+Added by this project:
 
-On a debian based system you can also install make throught apt-get such as:
+* **libRaptorQ** (+ Eigen3) — FEC. Point CMake at it with `LIBRAPTORQ_DIR`.
+* **GStreamer 1.x** + `gstreamer-app` + libav (`avdec_h265`) — video.
+  On the Radxa additionally the Rockchip MPP plugin (`mpph265enc`).
+* **OpenCV** — RX display.
+* **libiio** — only for the optional `pluto_rx` target.
 
-~~~
-sudo apt-get install make
-~~~
+## Build
 
-### Doxygen (optional) ###
+Two machines, two builds. `src/` is the shared PHY library — any change
+there requires rebuilding the library, not just the examples.
+**`examples/fec_common.h` must be byte-identical on both machines**
+(`md5sum` it) — it defines the FEC wire format.
 
-Doxygen is used to auto-generate html documentation. If you want to build a local copy of the API you will need to have Doxygen installed. More information can be found at the [Doxygen website](http://www.doxygen.org)
-
-On a debian based system you can also install doxygen throught apt-get such as:
-
-~~~
-sudo apt-get install doxygen
-~~~
-
-You can also install a GUI tool call doxy-wizard through apt-get:
-
-~~~
-sudo apt-get install doxygen-gui
-~~~
-
-On MacOS a .dmg can be downloaded from the doxygen.org website by clicking on the downloads link.
-
-Note: After installing the .dmg, you will have to find the App in Finder and ctrl-click open it
-the first time otherwise MacOS won't let you open it for security reasons
-
-### UHD ###
-
-Universal Hardware Driver (UHD) is the library, provided by Ettus, that is used to communicated with the USRPs. For installation instructions see:
-
-[UHD Manual] (http://http://files.ettus.com/manual/)
-
-On a debian based system you can also install UHD throught apt-get such as:
-
-~~~
-sudo apt-get install libuhd-dev
-~~~
-
-Or you can follow the [build guide] (http://files.ettus.com/manual/page_build_guide.html) to build from source
-
-### FFTW3 ###
-
-FFTW version 3 is the library used for computing the Fast Fourier Transforms. For more information see the [FFTW project home page] (http://www.fftw.org/index.html).
-
-On a debian based system the easiest way to install FFTW3 is to use apt-get such as:
-
-~~~
-sudo apt-get install libfftw3-3
-~~~
-or
-~~~
-sudo apt-get install libfftw3-dev
-~~~
-
-There are also instructions in their website (linked above) to install from source.
-
-### Boost ###
-
-Boost is required for UHD. It is also used for the CRC and time functions.
-
-On a debian based system the easiest way to install Boost is to use apt-get such as:
-
-~~~
-sudo apt-get install libboost-dev
-~~~
-
-To install from source download download the latest source and build it locally such as:
-
-~~~
-tar xvf boost_1_x_y.tar.bzip2
-cd boost_1_x_y
-./bootstrap.sh
-./b2 -j4
-~~~
-
-This project assumes that boost is installed in /usr/local/ by default
-
-You can find more detailed installation instructions on the [Boost Website](http://www.boost.org/).
-
-### pthread ###
-
-Posix threads (pthread) is the library used for handling all of the threading in the receiver chain. You should already
-have the pthread library as it comes with the linux kernel but if you can also get/update it with apt-get such as:
-
-~~~
-sudo apt-get install libpthread-stubs0-dev
-~~~
-
-## Build ##
-
-### Compile ###
-
-The easiest way to compile the code is to download it come github (clone) and then use CMake & make.
-
-~~~
-git clone https://github.com/bmorgan5/fun_ofdm.git
-cd fun_ofdm
-mkdir build
-cd build
-cmake ..
+```bash
+git clone <this repo> && cd custom_ofdm
+mkdir build && cd build
+cmake -DWITH_FEC=ON -DWITH_TUI=ON -DWITH_AGC=ON \
+      -DLIBRAPTORQ_DIR=/path/to/libRaptorQ/src ..
 make
-~~~
+```
 
-### Install (Optional) ###
+| CMake option | Meaning | Recommended |
+|---|---|---|
+| `WITH_FEC` | RaptorQ FEC (must match on TX and RX) | **ON** |
+| `WITH_TUI` | terminal link-health display (RX) | ON |
+| `WITH_AGC` | software AGC v2 (RX) | ON |
+| `WITH_OVERLAY` | on-video HUD (RX) | optional |
+| `WITH_DIAG` | legacy hardware-RSSI thread | **OFF** — dead end on B200 mini, implicated in instability |
+| `WITH_PLUTO` | build `pluto_rx` (needs libiio) | ON on the ground box if using a Pluto+ |
 
-If you want to install the project and use it as a library you can use the install target after you have compiled everything:
+Binaries land in `bin/` — run `./bin/video_rx`, not a stale copy from a
+build directory.
 
-~~~
-sudo make install
-sudo ldconfig
-~~~
+## Configuration — the rules that bite
 
-*Note: Don't forget the 'ldconfig' command, otherwise gcc won't be able to find your newly installed fun_ofdm library.
+These constants live at the top of `video_tx.cpp` / `video_rx.cpp` and in
+`fec_common.h`. Violating the first two produces **zero packets, silently**.
 
-### Documentation (Optional) ###
+1. **`FREQ` identical on both ends** (this project: `3.3e9`, the licensed
+   band). A 3.3/3.4 mismatch has burned this project twice.
+2. **`SAMPLE_RATE` identical on both ends** (this project: `10e6`).
+3. **Capacity budget.** 10 Msps QPSK 1/2 carries ≈ 2.4 Mbit/s. The encoder
+   bitrate must satisfy `BPS × (1 + R/K) < capacity`. At K=32, R=16 (50 %
+   overhead): `BPS ≈ 1.2–1.5 Mbit/s`. Oversubscribing doesn't degrade
+   gracefully — the queue drops everything but keyframes and you get ~3 fps.
+4. **FEC K/R.** K=32, **R=16** is the proven configuration (R=8 recovered
+   71 % of generations in the field; R=16 recovered 92 %+). Burst tolerance
+   per generation ≈ R packets ≈ 70 ms of outage at typical packet rates.
+5. **AGC:** `set_window(-28.0, -14.0)` (dBFS), `set_gain_band(10, 70)`.
+   Do **not** override `set_period_ms` — the attack/release timing assumes
+   the 100 ms default.
+6. Run the RX with `sudo` (or grant rtprio) for realtime scheduling.
 
-The project uses Doxygen to auto-generate html API documentation. To build the documentation locally:
+## Running
 
-~~~
-cd docs/doxygen/
-doxygen Doxyfile
-open html/index.html
-~~~
+```bash
+# Ground:
+sudo ./bin/video_rx                      # TUI + video window; 'q' quits
+sudo ./bin/video_rx 2>rx.log             # capture AGC/diversity logs
 
-# Testing #
+# Drone:
+./bin/video_tx
 
-## Simulation ##
+# Optional diversity branches (ground, after the Pluto+ clock is set up):
+./bin/pluto_rx --uri ip:192.168.2.1 --gain 50 --channels 2
+# stderr prints per-branch pkt/s and peak |sample| (lower --gain if ≥0.9);
+# video_rx prints "[diversity] listening on 127.0.0.1:5599" and simply
+# gains packets. Acid test: unplug the B200 antenna — video keeps flowing.
+```
 
-The easiest way to test that everything built correctly is to run *sim* in the fun_ofdm/bin directory as this does not require any USRPs to be connected. The source code for this example can be found in fun_ofdm/examples/test_sim.cpp. If everything compiled correctly you should see an output that looks something like:
+The TUI reads top-to-bottom as signal → PHY → FEC → application. A healthy
+link: `Rejected` near zero, `gens lost` ≈ 0, `Repair use` well under 20 %,
+`Link rate ≈ Video rate`.
 
+## Testing
 
-> [path to fun_ofdm]/fun_ofdm/bin $ sudo ./sim
-> I'm a little tea pot, short and stout.....here is my handle.....blah blah blah.....this rhyme sucks!I'm a little tea pot, short and stout.....here is my handle.....blah blah blah.....this rhyme sucks!I'm a little tea pot, short and stout.....here is my handle.....blah blah blah.....this rhyme sucks!
->
-> ...
->
-> ...
->
-> I'm a little tea pot, short and stout.....here is my handle.....blah blah blah.....this rhyme sucks!I'm a little tea pot, short and stout.....here is my handle.....blah blah blah.....this rhyme sucks!I'm a little tea pot, short and stout.....here is my handle.....blah blah blah.....this rhyme sucks!
->
-> Received 100 packets
->
-> Time elapsed: 1500.481000
+Every subsystem has a hermetic self-test — no radio needed. Run them after
+touching anything, and **bench-test before flying** any change to `src/`.
 
-## Test Tx ##
+| Suite | Covers |
+|---|---|
+| `cfo_selftest` | CFO estimate corrects a known offset; clip gate refuses clipped preambles; watchdog clears stale corrections |
+| `agc_selftest` | closed-loop AGC: hold / clip-attack / step caps / anti-pumping on brief fades / gated release / rail anti-windup |
+| `fec_window_selftest` | decoder sync-hardening: lone corrupted gen-id can't move the window; corroborated jumps do; watchdog heals wedges and TX restarts |
+| `diversity_selftest` | UDP framing, garbage rejection, two-branch concurrency integrity, merge into the real decoder, overload throughput |
+| `spreader_selftest` | interleaver: full + partial generations, burst spreading ≤ R per generation, idle flush |
+| `ppdu_loopback_test` | TX→RX chain in memory, with AWGN sweep (Viterbi cliff) |
 
-To test that the transmitter is working you can run *test_tx* in the fun_ofdm/bin directory. This test requires a USRP so be sure to have one plugged connected properly. (To test if your computer can see the USRP you can use 'uhd_find_devices'). The source code for this can be found in fun_ofdm/examples/test_tx. If everything goes as expected you should see soemthing like:
+Each is one `.cpp` with a build one-liner in its header (RaptorQ is stubbed
+where FEC math isn't the subject). Suites with radio APIs use instrumented
+fakes so assertions cover *speed and step size*, not just final values.
 
-> [path to download dir]/fun_ofdm/bin $ sudo ./test_tx
->
-> linux; GNU C++ version 4.8.1; Boost_105300; UHD_003.007.001-72-g383061d8
->
-> Testing transmit chain...
->
-> -- Opening a USRP2/N-Series device...
->
-> -- Current recv frame size: 1472 bytes
->
-> -- Current send frame size: 1472 bytes
->
-> Sending burst 1 of 20 at 1/2 BPSK
->
-> Sending burst 2 of 20 at 1/2 BPSK
->
-> Sending burst 3 of 20 at 1/2 BPSK
->
-> Sending burst 4 of 20 at 1/2 BPSK
->
-> Sending burst 5 of 20 at 1/2 BPSK
->
-> ...
->
-> ...
->
-> Sending packet 995 of 1000 at 1/2 BPSK
->
-> Sending packet 996 of 1000 at 1/2 BPSK
->
-> Sending packet 997 of 1000 at 1/2 BPSK
->
-> Sending packet 998 of 1000 at 1/2 BPSK
->
-> Sending packet 999 of 1000 at 1/2 BPSK
->
-> Sending packet 1000 of 1000 at 1/2 BPSK
+## Known issues
 
-## Test Rx ##
+* TUI prints doubled section headers and a stray `Link rate: 0 bps` in the
+  FEC section — cosmetic merge artifact; the application-layer numbers are
+  authoritative.
+* Hardware RSSI shows `n/a` by design — the B200 mini's sensor is
+  unreadable while streaming. The dBFS level from the software power
+  monitor is the real measurement.
+* The `pluto_rx` UDP transport assumes localhost (datagrams exceed a 1500
+  MTU; loopback doesn't care).
 
-Testing the receiver is a bit more complicated. This test requires at least one USRP for the receiver, but you will probably want to have a second USRP so that you can transmit packets for the receiver to receive as well. To do this,
-first run test_rx in the fun_ofdm/bin directory. If you are on a clear channel and don't have anything transmitting you will probably see something like this:
+## Troubleshooting (from this project's actual history)
 
-> [path to download dir]/fun_ofdm/bin $ sudo ./test_rx
->
-> linux; GNU C++ version 4.8.1; Boost_105300; UHD_003.007.001-72-g383061d8
->
-> Testing receive chain...
->
-> Instantiating the usrp.
->
-> -- Opening a USRP2/N-Series device...
->
-> -- Current recv frame size: 1472 bytes
->
-> -- Current send frame size: 1472 bytes
->
-> -- Detecting internal GPSDO.... No GPSDO found
->
-> -- not found
->
-> Invalid CRC (length 709)
->
-> Invalid CRC (length 3050)
->
+* **Zero packets, `NO SIGNAL`, RSSI at noise floor** → `FREQ` or
+  `SAMPLE_RATE` mismatch between TX and RX, or the TX isn't transmitting
+  (its TX LED is off when no samples flow). Check the constants first —
+  this is the most common total-failure cause.
+* **AGC gain frozen / never moves** → the `frame_detector` power tap isn't
+  in the built library: `grep -c RxPowerMonitor src/frame_detector.cpp`,
+  then a *clean* rebuild (the tap is in `libfun_ofdm`, not the example).
+* **Link healthy, then rots over minutes; RX restart fixes it** → you're
+  running a pre-hardening `fec_decoder.h`. The sync-hardened decoder
+  self-heals in ~1.5 s; verify with `fec_window_selftest`.
+* **Link dies on close approach and doesn't recover until backed way off**
+  → front-end saturation (LNA + strong signal). Software cannot fix it;
+  bypass/attenuate the LNA or back off TX power.
+* **3 fps, huge frames, link rate ≈ video rate** → encoder bitrate exceeds
+  link capacity; redo the budget in rule 3 above.
+* **`Ref locked: NO`** → that radio isn't seeing the 10 MHz reference —
+  check the OCXO feed before anything else; an undisciplined pair is a
+  different (worse) link.
+* **Everything built but behavior didn't change** → stale binary or stale
+  library: `rm -rf build`, rebuild, and run from `bin/`.
 
-Don't worry about the 'Invalid CRC (length 709)' as this just indicates a false alarm that was successfully detected and dropped when the CRC failed in the frame decoder block.
+## Roadmap
 
-Once you have the receiver up and running you can then run *test_tx* to transmit some packets for the receiver to receive. If everything works as expected you should see something like this:
+Soft-decision Viterbi (~+2 dB); a slow back-channel for TX power control
+and adaptive bitrate/MCS (turns the range cliff into a slope, and solves
+close-approach overload at the source); coherent 2-branch MRC on the
+Pluto+'s shared-LO channels; `phy_spreader` integration if motion testing
+shows clumped generation loss.
 
-> [path to download dir]/fun_ofdm/bin $ sudo ./test_rx
->
-> linux; GNU C++ version 4.8.1; Boost_105300; UHD_003.007.001-72-g383061d8
->
-> Testing receive chain...
->
-> Instantiating the usrp.
->
-> -- Opening a USRP2/N-Series device...
->
-> -- Current recv frame size: 1472 bytes
->
-> -- Current send frame size: 1472 bytes
->
-> Invalid CRC (length 1775)
->
-> Received 1 packets at 23:33:55.636086
->
-> Received 2 packets at 23:33:55.639852
->
-> Received 3 packets at 23:33:55.643764
->
-> Received 4 packets at 23:33:55.647949
->
-> Received 5 packets at 23:33:55.652317
->
-> Received 6 packets at 23:33:55.656672
->
-> Received 7 packets at 23:33:55.662527
->
-> Received 8 packets at 23:33:55.666724
->
-> Received 9 packets at 23:33:55.670681
->
-> Received 10 packets at 23:33:55.673931
->
-> ...
->
-> ...
->
-> Received 995 packets at 08:23:39.734422
->
-> Received 996 packets at 08:23:39.744281
->
-> Received 997 packets at 08:23:39.754190
->
-> Received 998 packets at 08:23:39.764118
->
-> Received 999 packets at 08:23:39.773871
->
-> Received 1000 packets at 08:23:39.783544
+## License & credits
 
-Depending on the PHY Rate used at the transmitter and if you are lucky (as I was when I ran this test) you will receive all transmitted packets. However, as long as you receive anywhere >90% of transmitted packets you can safely assume that you have everything set up correctly.
-
-# Usage #
-
-This project was developed as a library for furthering wireless communications research in the Fundamentals of Networking lab (FUNLAB) at the University of Washington and is released under GPL V2 for anybody to use/modify however they like.
-
-The full API is available on the funlab website: [fun_ofdm API](http://www.ee.washington.edu/research/funlab/fun_ofdm/index.html).
-
-## Parameters ##
-
-The main parameters used for the transmitter / receiver are as follows:
-
-* freq        - Center frequence [default=5.72e9 (5.72 GHz)]
-* sample_rate - AD/DA sampling frequency (also corresponds to bandwidth) [default=5e6 (5 MHz)]
-* tx_gain     - Output amplifier gain (0-35 on USRP N210) [default=20]
-* rx_gain     - Input amplifier gain  (0-35 on USRP N210) [default=20]
-* tx_amp 		  - Scale factor for transmit samples. Used to give finer control over output power. [default=1]
-* device_addr - IP Address of USRP as a string. An empty string will automatically find an eligable USRP [default=""]
-
-* phy_rate 	  - The modulation and coding rate used when building the phy frames [default=1_2_BPSK (BPSK w/ Rate R=1/2 Convolutional Code)]
-
-## Transmitter ##
-
-Building the transmitter and sending packets is very easy. The following code snippet builds a transmitter object with the default USRP parameters and sends a single packet.
-
-~~~
-...
-
-usrp_params params = usrp_params();
-transmitter tx = transmitter(params);
-
-std::string s = "Hello World";
-std::vector<unsigned char> data = std::vector<unsigned char>(12);
-memcpy(&data[0], &s[0], 12);
-tx.send_packet(data);
-
-...
-
-~~~
-
-## Receiver ##
-
-Similarly, building the receiver and receiving packets is just as. The following code snippet builds a receiver object with the default USRP parameters and passes a function pointer to the callback function aptly named 'callback'.
-
-~~~
-...
-
-usrp_params params = usrp_params();
-receiver rx = receiver(&callback, params);
-
-while(1) sleep(1); //Let the main thread spin while the receive threads receives packets
-
-...
-~~~
-
-## Simple Transciever ##
-
-Putting the above two examples together we can make a very simple transceiver using the default USRP parameters that receives for 4 seconds then transmits a single packet and repeats. *Note: the callback function is only called if the receiver actually successfully receives a packet. In this case the contents of the packet are simply printed to standard out (i.e. the terminal). If the receiver doesn't receive anything then essentially nothing happens.
-
-~~~
-int main()
-{
-
-    usrp_params params = usrp_params();
-    transmitter tx = transmitter(params);
-    receiver rx = receiver(&callback, params);
-
-    std::string s = "Hello World";
-    std::vector<unsigned char> data = std::vector<unsigned char>(12);
-    memcpy(&data[0], &s[0], 12);
-    tx.send_packet(data);
-
-    while(1)
-    {
-        sleep(4);
-        rx.pause();
-        tx.send_packet(data);
-        cout << "Sending \"Hello World\" " << std::endl;
-        rx.resume();
-    }
-
-    return 0;
-}
-
-void callback(std::vector<std::vector<unsigned char> > payloads)
-{
-    for(int i = 0; i < payloads.size(); i++)
-    {
-        std::cout << "Received a packet" << std::endl;
-    }
-
-}
-~~~
-
-This example only needs one USRP to be connected since the transmitter and receiver as the code is never trying to transmit and receive at the same time.
-
-The full code for this simple transcieiver can be found in the examples directory titled simple_transciver.cpp. *Note: this file assumes that the fun_ofdm library has been installed to the system instead of being build locally.
-
-
-# Troubleshooting #
-
-+ Can you see your USRP with 'uhd_find_device'?
-+ Did you run the examples using as root (i.e. 'sudo')?
-+ Have you tried different gain / tx_amp settings?
-+ Did you run 'ldconfig' after 'sudo make install'?
-+ Are both the transmitter and receiver using the same center freq? sample rate?
-+ Are compiler optimizations turned on (they are turned on by default in the top level CMakeLists.txt)
-+ If you see 'D's printed to the screen that might indicate hardware problems
-	+ Could be your ethernet card - see the sysconf changes recommended by Ettus
-	+ Could be your processor is too slow/too busy
-	+ Could be not enough Ram available
-
-# Contact #
-
-For help troubleshooting please make sure to include the following:
-
-+ Operating System (Ubuntu, Linx Mint, etc.) and version
-+ USRP & Daughtercard (USRP N210 & XCVR 2450)
-+ What parameters you are using (freq, sample rate, etc)
-+ What you are trying to do/what is not working
-+ Any other useful information
-
-Any helpful feedback (i.e. anything that isn't spam or trolling) is much appreciate!
-
+GPL v2, inherited from
+[fun_ofdm](https://github.com/bmorgan5/fun_ofdm) (FUNLAB, University of
+Washington) — the OFDM PHY this project stands on. FEC by
+[libRaptorQ](https://github.com/LucaFulchir/libRaptorQ). Everything else —
+the video pipeline, FEC integration and sync hardening, the CFO fix, AGC v2,
+the diversity architecture, and the test suites — was built and
+field-debugged for this link.
