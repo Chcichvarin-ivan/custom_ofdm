@@ -135,7 +135,13 @@ namespace fun
         crc.process_bytes(&data[0], 2 + payload.size());
         unsigned int calculated_crc = crc.checksum();
         memcpy(&data[2 + payload.size()], &calculated_crc, 4);
-
+        /*
+        // Calcualate and append the CRC  — TEST: payload only, skip 2-byte service
+        boost::crc_32_type crc;
+        crc.process_bytes(&data[2], payload.size());   // was &data[0], 2 + payload.size()
+        unsigned int calculated_crc = crc.checksum();
+        memcpy(&data[2 + payload.size()], &calculated_crc, 4);
+        */
         // Scramble the data
         std::vector<unsigned char> scrambled(num_data_bytes+1, 0);
         int state = 93, feedback = 0;
@@ -269,11 +275,23 @@ namespace fun
         unsigned int calculated_crc = crc.checksum();
         unsigned int given_crc = 0;
         memcpy(&given_crc, &decoded[2 + header.length], 4);
-
+/*
+        // Calculate the CRC  — TEST: payload only, skip 2-byte service
+        boost::crc_32_type crc;
+        crc.process_bytes(&decoded[2], header.length);   // was &decoded[0], 2 + header.length
+        unsigned int calculated_crc = crc.checksum();
+        unsigned int given_crc = 0;
+        memcpy(&given_crc, &decoded[2 + header.length], 4);
+*/
         // Verify the CRC
-        if (header.length != 1930)//(given_crc != calculated_crc)
+        if (header.length != 1930)//given_crc != calculated_crc)//
         {
             //std::cerr << "Invalid CRC (length " << header.length << ")" << std::endl;
+            /*std::cerr << "len " << header.length
+                << "  calc " << std::hex << calculated_crc
+                << "  given " << given_crc << std::dec
+                << (calculated_crc == given_crc ? "  MATCH" : "  fail") << "\n";
+*/
             // Indicate failure
             return false;
         }
