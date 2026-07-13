@@ -421,11 +421,9 @@ int main(int /*argc*/, char** /*argv*/)
     // Slow software AGC: keeps RSSI in a target window by nudging RX gain ~1Hz.
     // Owns the gain (don't also enable UHD AGC). Parameters match the design.
     stats::LinkAgc agc(rx.get_multi_usrp(), g_stats, /*chan=*/0);
-    agc.set_window(-60.0, -35.0);
-    agc.set_gain_band(10.0, 60.0);
-    agc.set_step_db(1.0);
-    agc.set_period_ms(1000);
-    g_agc_ptr = &agc;
+    agc.set_window(-28.0, -14.0);     // dBFS, wide dead zone (v2 design)
+    agc.set_gain_band(10.0, 70.0);
+    agc.set_console_output(true);     // watch [AGC v2] lines during the walk test
 #  if defined(WITH_TUI) || defined(WITH_OVERLAY)
     agc.set_console_output(false);
 #  endif
