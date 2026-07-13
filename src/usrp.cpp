@@ -83,8 +83,6 @@ namespace fun
             // Start the RX stream continuously; it stays running.
             uhd::stream_cmd_t stream_cmd(
                         uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
-            //const auto sensor = m_usrp->get_mboard_sensor("ref_locked");
-            //std::cerr << "Ref locked: " << sensor.to_pp_string() << std::endl;
             stream_cmd.stream_now = true;
             m_rx_streamer->issue_stream_cmd(stream_cmd);
 

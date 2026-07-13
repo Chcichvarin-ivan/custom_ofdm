@@ -2,7 +2,8 @@
 # Examples CMakeLists.txt — RaptorQ FEC + TUI + DIAG + AGC + OVERLAY,
 # plus GStreamer for the H.265 video bridges.
 ########################################################################
-cmake_policy(SET CMP0167 OLD)
+#
+# cmake_policy(SET CMP0167 OLD)
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
@@ -35,6 +36,7 @@ option(WITH_TUI "Build video bridges with terminal link-health display" OFF)
 option(WITH_OVERLAY "Build video_rx with on-video HUD overlay" OFF)
 option(WITH_DIAG "Build video_rx with the RSSI/error diagnostic thread" OFF)
 option(WITH_AGC "Build video_rx with the software AGC" OFF)
+option(WITH_STATS "Build video_rx with the software STATS" OFF)
 
 find_package(Threads REQUIRED)
 
