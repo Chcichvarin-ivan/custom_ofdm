@@ -5,7 +5,7 @@
 namespace fec {
 
     constexpr uint16_t SOURCE_SYMBOLS_PER_GEN = 32;   // K
-    constexpr uint16_t REPAIR_SYMBOLS_PER_GEN = 16;    // R (25% overhead)
+    constexpr uint16_t REPAIR_SYMBOLS_PER_GEN = 8;    // R (25% overhead)
     constexpr uint16_t SYMBOLS_PER_GEN        = SOURCE_SYMBOLS_PER_GEN
                                               + REPAIR_SYMBOLS_PER_GEN;
     constexpr uint16_t SYMBOL_SIZE            = 1920;  // multiple of 4

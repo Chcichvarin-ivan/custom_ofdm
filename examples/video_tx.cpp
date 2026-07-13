@@ -68,8 +68,8 @@ static const Rate   PHY_RATE    = RATE_1_2_QPSK;
 static const char* CAM_DEVICE = "/dev/video11";
 static const int   FRAME_W    = 1280;
 static const int   FRAME_H    = 720;
-static const int   TARGET_FPS = 30;
-static const int   BPS        = 4000000;   // 4 Mbit/s
+static const int   TARGET_FPS = 20;
+static const int   BPS        = 1200000;   // 4 Mbit/s
 static const int   GOP        = 15;        // keyframe interval (frames)
 
 #ifdef WITH_FEC
