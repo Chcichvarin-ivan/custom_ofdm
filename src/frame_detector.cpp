@@ -3,12 +3,20 @@
  *
  * This block is in charge of detecting the beginning of a frame using the
  * short training sequence in the preamble.
+ *
+ * SOFTWARE-AGC TAP (v2): this block already computes per-sample power
+ * (|sample|^2) for its normalized auto-correlation. We additionally
+ * accumulate, per batch, (a) the mean power and (b) the fraction of samples
+ * near full scale, and publish both to RxPowerMonitor for the software AGC.
+ * The mean drives the ordinary gain-trim decisions; the clip fraction drives
+ * the emergency fast-attack (clipping) path. Detection behavior is unchanged.
  */
 
 #include <cstring>
 #include <iostream>
 
 #include "frame_detector.h"
+#include "rx_power_monitor.h"   // software-AGC tap (v2: mean + clip fraction)
 
 namespace fun
 {
@@ -43,6 +51,9 @@ namespace fun
         if(input_buffer.size() == 0) return;
         output_buffer.resize(input_buffer.size());
 
+        double batch_power = 0.0;   // sum of |sample|^2 (AGC mean level)
+        int    clip_count  = 0;     // samples near full scale (AGC clip path)
+
         // Step through the samples
         for(int x = 0; x < input_buffer.size(); x++)
         {
@@ -56,8 +67,11 @@ namespace fun
             // Update the correlation accumulators
             m_corr_acc.add(input_buffer[x] * std::conj(delayed));
 
-            // Update the power accumulator
-            m_power_acc.add(std::norm(input_buffer[x]));
+            // Update the power accumulator (reuse the norm for the AGC tap)
+            double inst_power = std::norm(input_buffer[x]);
+            m_power_acc.add(inst_power);
+            batch_power += inst_power;
+            if (inst_power > RxPowerMonitor::CLIP_LIN) ++clip_count;
 
             // Calculate the normalized correlations
             double corr = std::abs(m_corr_acc.sum) / m_power_acc.sum;
@@ -85,6 +99,10 @@ namespace fun
             output_buffer[x].sample = input_buffer[x];
         }
 
+        // Publish this batch's statistics for the software AGC.
+        RxPowerMonitor::publish(batch_power / input_buffer.size(),
+                                (double)clip_count / input_buffer.size());
+
         // Carryover the last 16 output samples
         memcpy(&m_carryover[0],
                &input_buffer[input_buffer.size() - STS_LENGTH],
@@ -92,5 +110,3 @@ namespace fun
     }
 
 }
-
-
