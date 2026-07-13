@@ -303,7 +303,7 @@ static void process_app_packet(const std::vector<unsigned char>& pkt)
     if (payload_sz > vid::PAYLOAD_SIZE) return;
 
 #ifdef WITH_STATS
-    g_stats.note_app_packet_rx();
+    g_stats.note_app_packet_rx(payload_sz);
 #endif
 
     PartialFrame& pf = g_partials[frame_id];
