@@ -45,9 +45,22 @@ set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake/Modules)
 # Compiler specific setup
 ########################################################################
 # C++ Compile Flags
-set(CMAKE_CXX_FLAGS "-m64 -std=c++11 -mssse3 -msse4.1")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3") # Optimization!!
 
+# Architecture-specific optimization flags.
+# x86 gets SSE; ARM (Radxa/aarch64) gets NEON-friendly flags instead —
+# -mssse3/-msse4.1/-m64 are Intel-only and don't exist on ARM.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
+    set(CMAKE_CXX_FLAGS "-m64 -std=c++11 -mssse3 -msse4.1")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3") # Optimization!!
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    # 64-bit ARM (Rock 5B): NEON is always available, no flag needed.
+    set(CMAKE_CXX_FLAGS "-std=c++11 -O3")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+    # 32-bit ARM: NEON must be requested explicitly.
+    set(CMAKE_CXX_FLAGS "-std=c++11 -O3 -mfpu=neon")
+else()
+    set(CMAKE_CXX_FLAGS "-std=c++11 -O3")
+endif()
 ########################################################################
 # Find build dependencies
 ########################################################################

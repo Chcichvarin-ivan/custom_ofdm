@@ -21,6 +21,11 @@
  * -DWITH_FEC so the FEC recovers lost packets before they break the stream.
  *
  * 720p @ 4 Mbit/s, keyframe every 15 frames (~0.5 s).
+ *
+ * RK3588 fd-LEAK NOTE: the hardware pipeline forces a colour-convert copy
+ * (NV12->I420->NV12) before mpph265enc. This is REQUIRED, not cosmetic — see
+ * the long comment at the pipeline string. Removing it (or making it
+ * passthrough) brings back the "dst has not fd" RGA crash after ~30 s.
  */
 
 #include <iostream>
@@ -30,8 +35,12 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <csignal>
 #include <arpa/inet.h>
+#include <sys/resource.h>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -55,8 +64,8 @@ using namespace fun;
 // ---------------------- Radio parameters ------------------------------------
 static const double FREQ        = 3.4e9;
 static const double SAMPLE_RATE = 20e6;
-static const double TX_GAIN     = 70.0;
-static const double TX_AMP      = 0.6;
+static const double TX_GAIN     = 75.0;
+static const double TX_AMP      = 0.7;
 static const Rate   PHY_RATE    = RATE_1_2_QPSK;
 
 // ---------------------- Video / encoder -------------------------------------
@@ -68,9 +77,9 @@ static const Rate   PHY_RATE    = RATE_1_2_QPSK;
 static const char* CAM_DEVICE = "/dev/video11";
 static const int   FRAME_W    = 1280;
 static const int   FRAME_H    = 720;
-static const int   TARGET_FPS = 20;
-static const int   BPS        = 1200000;   // 4 Mbit/s
-static const int   GOP        = 15;        // keyframe interval (frames)
+static const int   TARGET_FPS = 15;
+static const int   BPS        = 2200000;   // 1.2 Mbit/s
+static const int   GOP        = 5;        // keyframe interval (frames)
 
 #ifdef WITH_FEC
 static_assert(fec::SYMBOL_SIZE >= vid::PACKET_SIZE,
@@ -160,9 +169,110 @@ static void send_h265_frame(transmitter& tx, const unsigned char* data,
     }
 }
 
+// ---------------------- Producer/consumer frame queue -----------------------
+// The capture+encode thread (producer) pulls compressed frames from the encoder
+// at the full camera rate and pushes them here. The transmit thread (consumer)
+// pops them and does the slow FEC + OFDM send. Decoupling the two keeps the
+// appsink drained at the camera rate regardless of how slow the radio is, so
+// the encoder's OUTPUT pool never backs up and FPS stays smooth under FEC
+// bursts.
+//
+//   NOTE ON THE ~30 s "dst has not fd" CRASH: that was NOT caused by this
+//   backpressure. It was a per-frame dmabuf fd leak in the encoder's *input*
+//   zero-copy import path (it imports the HDMI-RX camera's DMA buffers and
+//   leaks one fd each frame until the 1024 fd limit is hit). The real fix is
+//   the forced colour-convert copy in the hardware pipeline string below; this
+//   threading is kept only for FPS smoothing, not as the crash fix.
+//
+// When the consumer falls behind, the queue caps at its depth and drops the
+// OLDEST non-keyframe frame — NEVER a keyframe, so the RX can always resync at
+// the next keyframe. A dropped delta frame looks like packet loss to the RX,
+// which its keyframe-resync handles.
+struct EncodedFrame {
+    std::vector<unsigned char> data;
+    bool      keyframe = false;
+    uint32_t  frame_id = 0;
+};
+
+class FrameQueue {
+public:
+    explicit FrameQueue(std::size_t max_depth) : m_max(max_depth) {}
+
+    // Producer side. Never blocks; applies the keyframe-aware drop policy when
+    // full. Returns the number of frames dropped to make room (usually 0).
+    int push(EncodedFrame&& f) {
+        int dropped = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_q.size() >= m_max) {
+                // Drop the oldest NON-keyframe to make room: walk from the
+                // front (oldest) and erase the first delta frame found.
+                bool removed = false;
+                for (auto it = m_q.begin(); it != m_q.end(); ++it) {
+                    if (!it->keyframe) {
+                        m_q.erase(it);
+                        removed = true;
+                        ++dropped;
+                        break;
+                    }
+                }
+                // Pathological case: every queued frame is a keyframe. Drop the
+                // oldest to bound latency/memory.
+                if (!removed) {
+                    m_q.pop_front();
+                    ++dropped;
+                }
+            }
+            m_q.push_back(std::move(f));
+        }
+        m_cv.notify_one();
+        return dropped;
+    }
+
+    // Consumer side. Blocks until a frame is available or the queue is stopped
+    // and drained. Returns false only when stopped and empty.
+    bool pop(EncodedFrame& out) {
+        std::unique_lock<std::mutex> lk(m_mtx);
+        m_cv.wait(lk, [this] { return !m_q.empty() || m_stop; });
+        if (m_q.empty()) return false;
+        out = std::move(m_q.front());
+        m_q.pop_front();
+        return true;
+    }
+
+    void stop() {
+        { std::lock_guard<std::mutex> lk(m_mtx); m_stop = true; }
+        m_cv.notify_all();
+    }
+
+private:
+    std::deque<EncodedFrame> m_q;
+    std::mutex               m_mtx;
+    std::condition_variable  m_cv;
+    std::size_t              m_max;
+    bool                     m_stop = false;
+};
+
 int main(int /*argc*/, char** /*argv*/)
 {
     gst_init(nullptr, nullptr);
+
+    // ---- fd-exhaustion backstop (defence-in-depth) ----
+    // The forced colour-convert copy in the hardware pipeline (below) is the
+    // REAL fix for the encoder's per-frame dmabuf fd leak, so the fd count
+    // should stay flat. This additionally raises the soft open-file limit to
+    // the hard maximum: if any residual slow leak ever exists, it turns a
+    // mid-flight encoder crash into many hours of headroom instead of ~30 s.
+    // Harmless when there's no leak, and needs no privileges (soft is only
+    // raised up to the existing hard limit). Remove if you don't want it.
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            rl.rlim_cur = rl.rlim_max;
+            if (setrlimit(RLIMIT_NOFILE, &rl) == 0)
+                std::cout << "fd soft limit raised to " << rl.rlim_cur << "\n";
+        }
+    }
 
     std::cout << "fun_ofdm H.265 video TX"
 #ifdef WITH_FEC
@@ -201,10 +311,38 @@ int main(int /*argc*/, char** /*argv*/)
         //   bps = bitrate (bits/s), rc-mode vbr, gop = keyframe interval.
         //   (If 'gop' is the wrong property name on your build, change it here;
         //    check `gst-inspect-1.0 mpph265enc | grep -iE "gop|key"`.)
+        //
+        // *** THE fd-LEAK FIX — DO NOT REMOVE ***
+        //   videoconvert ! I420 ! videoconvert ! NV12 ! queue
+        //
+        //   /dev/video11 is the HDMI-RX input: a MULTIPLANAR V4L2 device whose
+        //   buffers are DMA-backed. When mpph265enc zero-copy-imports those
+        //   buffers it leaks ONE dmabuf fd per frame; after ~1024 frames
+        //   (~32 s @ 30 fps) the process fd table fills and RGA dies with
+        //   "dst has not fd and address for render". Proven by watching
+        //   /proc/PID/fd: it climbs +30/s to 1023 then crashes. Feeding
+        //   videotestsrc (plain CPU buffers) NEVER leaked, because the encoder
+        //   then copies input into its own internal VPU pool instead of
+        //   importing.
+        //
+        //   The two converts force exactly that copy: a genuine
+        //   NV12->I420->NV12 colour conversion produces a fresh system-memory
+        //   buffer with no dmabuf to import, so the encoder falls back to its
+        //   leak-free internal pool. Verified: fd count flat at ~70 for
+        //   minutes. The converts are cheap chroma re-orders at 720p (a few %
+        //   CPU on the RK3588); the trailing queue gives the encoder its own
+        //   thread.
+        //
+        //   DO NOT "optimise" this to a single same-format videoconvert — that
+        //   negotiates to PASSTHROUGH (no copy), forwards the camera's dmabuf,
+        //   and the leak returns. The format must actually change.
         std::snprintf(desc, sizeof(desc),
             "v4l2src device=%s ! "
             "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1 ! "
-            "mpph265enc bps=%d rc-mode=vbr gop=%d ! "
+            "videoconvert ! video/x-raw,format=I420 ! "
+            "videoconvert ! video/x-raw,format=NV12 ! "
+            "queue ! "
+            "mpph265enc bps=%d rc-mode=cbr gop=%d ! "
             "h265parse config-interval=1 ! "
             "video/x-h265,stream-format=byte-stream,alignment=au ! "
             "appsink name=sink emit-signals=false sync=false "
@@ -258,27 +396,55 @@ int main(int /*argc*/, char** /*argv*/)
         return 1;
     }
 
-    uint32_t frame_id = 0;
+    // ---- Producer/consumer split ----
+    // Producer thread: pull encoded frames from the appsink as fast as they
+    // arrive and queue them. It does NOTHING slow, so the encoder's output pool
+    // is always drained and FPS stays smooth even when the radio is slow. (The
+    // ~30 s "dst has not fd" crash was the encoder's INPUT dmabuf import leak,
+    // not output backpressure — that is fixed by the forced colour-convert in
+    // the pipeline string above. This split is for FPS smoothing.) The consumer
+    // (this main thread) does the slow FEC + OFDM transmit. The bounded queue
+    // absorbs FEC bursts; when the consumer can't keep up, the queue drops the
+    // oldest delta frame (never a keyframe), which cooperates with the RX's
+    // keyframe-resync.
+    //
+    // Depth 8 ≈ 0.27 s at 30 fps: enough to ride out FEC bursts without piling
+    // on latency. Raise for burstier links, lower if latency matters more.
+    FrameQueue queue(8);
 
-    while (!g_stop.load()) {
-        // Pull one compressed H.265 frame from the hardware encoder.
-        GstSample* sample =
-            gst_app_sink_try_pull_sample(sink, 100 * GST_MSECOND);
-        if (!sample) {
-            if (gst_app_sink_is_eos(sink)) break;
-            continue;
-        }
-        GstBuffer* buf = gst_sample_get_buffer(sample);
-        bool keyframe =
-            !GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
+    std::thread producer([&]() {
+        uint32_t pid = 0;
+        while (!g_stop.load()) {
+            GstSample* sample =
+                gst_app_sink_try_pull_sample(sink, 100 * GST_MSECOND);
+            if (!sample) {
+                if (gst_app_sink_is_eos(sink)) break;
+                continue;
+            }
+            GstBuffer* buf = gst_sample_get_buffer(sample);
+            EncodedFrame f;
+            f.keyframe =
+                !GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
+            f.frame_id = pid++;     // every captured frame gets an id; gaps from
+                                    // dropped frames signal loss to the RX.
+            GstMapInfo map;
+            if (gst_buffer_map(buf, &map, GST_MAP_READ)) {
+                f.data.assign(map.data, map.data + map.size);
+                gst_buffer_unmap(buf, &map);
+            }
+            gst_sample_unref(sample);   // release the DMA buffer immediately
 
-        GstMapInfo map;
-        if (gst_buffer_map(buf, &map, GST_MAP_READ)) {
-            send_h265_frame(tx, map.data, map.size, keyframe, frame_id);
-            gst_buffer_unmap(buf, &map);
-            ++frame_id;
+            if (!f.data.empty())
+                queue.push(std::move(f));   // drop policy handled inside
         }
-        gst_sample_unref(sample);
+        queue.stop();   // unblock the consumer so it drains and exits
+    });
+
+    // Consumer (main thread): pop queued frames and do the slow FEC + transmit.
+    EncodedFrame f;
+    while (queue.pop(f)) {
+        send_h265_frame(tx, f.data.data(), f.data.size(),
+                        f.keyframe, f.frame_id);
 
 #ifdef WITH_FEC
         // Periodic flush so a stalled stream still drains (don't flush every
@@ -286,7 +452,7 @@ int main(int /*argc*/, char** /*argv*/)
         static auto last_flush = std::chrono::steady_clock::now();
         auto now_f = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
-                now_f - last_flush).count() > 200) {
+                now_f - last_flush).count() > 400) {
             g_enc.flush();
             last_flush = now_f;
             while (g_enc.has_phy_packet()) {
@@ -298,6 +464,8 @@ int main(int /*argc*/, char** /*argv*/)
         }
 #endif
     }
+
+    producer.join();
 
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);

@@ -2,8 +2,7 @@
 # Examples CMakeLists.txt — RaptorQ FEC + TUI + DIAG + AGC + OVERLAY,
 # plus GStreamer for the H.265 video bridges.
 ########################################################################
-#
-# cmake_policy(SET CMP0167 OLD)
+#cmake_policy(SET CMP0167 OLD)
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
